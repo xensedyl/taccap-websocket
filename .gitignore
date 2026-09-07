@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+*.egg-info/
 *.log
 *.pid
 *.jpg
@@ -10,6 +11,8 @@ __pycache__/
 .venv/
 .runtime/
 offline/
+build/
+dist/
 !.log/
 .log/*
 !.log/.gitkeep

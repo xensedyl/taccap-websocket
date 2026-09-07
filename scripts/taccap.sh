@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 config_file="${TACCAP_CONFIG_FILE:-$project_dir/config/taccap.env}"
 if [[ -f "$config_file" ]]; then
     # shellcheck disable=SC1090
@@ -84,7 +84,7 @@ run_server() {
     echo "$(date --iso-8601=seconds) starting TacCap service"
     echo "listen=$bind_host:$port python=$python_bin"
     cd "$project_dir"
-    exec "$python_bin" -u server.py \
+    exec "$python_bin" -u src/taccap_websocket/server.py \
         --host "$bind_host" \
         --port "$port" \
         --ffmpeg "$ffmpeg_bin"
@@ -125,7 +125,7 @@ start_service() {
         fi
     fi
     cd "$project_dir"
-    nohup "$project_dir/taccap.sh" run >/dev/null 2>&1 &
+    nohup "$project_dir/scripts/taccap.sh" run >/dev/null 2>&1 &
     local new_pid=$!
     printf '%s\n' "$new_pid" >"$pid_file"
     wait_until_ready "$new_pid"

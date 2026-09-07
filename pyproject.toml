@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taccap-websocket"
+version = "0.1.0"
+description = "TacCap gripper, tactile camera and wrist camera device service"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+dependencies = [
+    "numpy==2.2.4",
+    "opencv-python==4.12.0.88",
+    "xensesdk==2.1.3",
+    "taccap-gripper==0.1.9",
+]
+
+[project.scripts]
+taccap-client = "taccap_websocket.client:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

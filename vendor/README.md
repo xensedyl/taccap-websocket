@@ -8,6 +8,6 @@ repository:
 
 `https://github.com/XenseRobotics-AI/TacCap-Gripper.git`
 
-Run `bundle_offline.sh` to collect a compatible Python runtime, `xensesdk`,
+Run `bundle.sh` to collect a compatible Python runtime, `xensesdk`,
 TacCap-Gripper and all public Python wheels into the ignored `offline/`
 directory before deploying to an isolated target.
