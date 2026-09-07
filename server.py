@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""TacCap remote bridge for the computer at 10.192.1.4.
+"""Portable TacCap remote bridge for a gripper host.
 
-The server intentionally binds to loopback by default.  Reach it from the
-operator computer through an SSH local-forward instead of exposing motor
-control on the LAN.
+The server listens on the target device and exposes camera, tactile and motor
+control APIs to trusted LAN clients.
 """
 
 from __future__ import annotations
@@ -95,26 +94,20 @@ class CameraSpec:
     sdk_serial: str | None = None
 
 
-# These are only a last-resort compatibility map.  At startup the service
-# discovers the currently attached firmware/USB serials and replaces this map;
-# keeping a fallback means the HTTP API still exposes a useful ``unavailable``
-# entry while a device is being replugged.
+# These generic placeholders preserve the public two-side/six-camera schema
+# while hardware is absent or being replugged.  Real paths are discovered at
+# startup or supplied through TACCAP_DEVICE_CONFIG; no machine-specific serial
+# number belongs in source control.
 FALLBACK_GRIPPER_SPECS = {
     "left": GripperSpec(
         side="left",
-        serial_number="5C96089218",
-        mcu_device=(
-            "/dev/serial/by-id/"
-            "usb-1a86_USB_Dual_Serial_5C96089218-if02"
-        ),
+        serial_number="unavailable-left",
+        mcu_device="/dev/taccap-unavailable/left-mcu",
     ),
     "right": GripperSpec(
         side="right",
-        serial_number="5C96089216",
-        mcu_device=(
-            "/dev/serial/by-id/"
-            "usb-1a86_USB_Dual_Serial_5C96089216-if02"
-        ),
+        serial_number="unavailable-right",
+        mcu_device="/dev/taccap-unavailable/right-mcu",
     ),
 }
 
@@ -124,62 +117,42 @@ FALLBACK_CAMERA_SPECS = {
         "left",
         "wrist",
         "左夹爪相机",
-        "/dev/v4l/by-id/usb-LRCP_imx385_XCA28Z0017s_XCA28Z0017s-video-index0",
+        "/dev/taccap-unavailable/left-wrist",
     ),
     "left_tactile_left": CameraSpec(
         "left_tactile_left",
         "left",
         "tactile_raw",
         "左夹爪 · 左指触觉（标定矫正）",
-        (
-            "/dev/v4l/by-id/"
-            "usb-Xense_Robotics_Co_._Ltd._GSPS01A30Z0043_"
-            "GSPS01A30Z0043-video-index0"
-        ),
-        "GSPS01A30Z0043",
+        "/dev/taccap-unavailable/left-tactile-left",
     ),
     "left_tactile_right": CameraSpec(
         "left_tactile_right",
         "left",
         "tactile_raw",
         "左夹爪 · 右指触觉（标定矫正）",
-        (
-            "/dev/v4l/by-id/"
-            "usb-Xense_Robotics_Co_._Ltd._GSPS01A30Z0044_"
-            "GSPS01A30Z0044-video-index0"
-        ),
-        "GSPS01A30Z0044",
+        "/dev/taccap-unavailable/left-tactile-right",
     ),
     "right_wrist": CameraSpec(
         "right_wrist",
         "right",
         "wrist",
         "右夹爪相机",
-        "/dev/v4l/by-id/usb-LRCP_imx385_XCA28Z0016s_XCA28Z0016s-video-index0",
+        "/dev/taccap-unavailable/right-wrist",
     ),
     "right_tactile_left": CameraSpec(
         "right_tactile_left",
         "right",
         "tactile_raw",
         "右夹爪 · 左指触觉（标定矫正）",
-        (
-            "/dev/v4l/by-id/"
-            "usb-Xense_Robotics_Co_._Ltd._GSPS01A30Z0041_"
-            "GSPS01A30Z0041-video-index0"
-        ),
-        "GSPS01A30Z0041",
+        "/dev/taccap-unavailable/right-tactile-left",
     ),
     "right_tactile_right": CameraSpec(
         "right_tactile_right",
         "right",
         "tactile_raw",
         "右夹爪 · 右指触觉（标定矫正）",
-        (
-            "/dev/v4l/by-id/"
-            "usb-Xense_Robotics_Co_._Ltd._GSPS01A30Z0042_"
-            "GSPS01A30Z0042-video-index0"
-        ),
-        "GSPS01A30Z0042",
+        "/dev/taccap-unavailable/right-tactile-right",
     ),
 }
 
@@ -378,6 +351,51 @@ def discover_specs(taccap_module: Any | None) -> tuple[dict[str, GripperSpec], d
     # discovered entries always win, including after a device-number change.
     for name, fallback in FALLBACK_CAMERA_SPECS.items():
         cameras.setdefault(name, fallback)
+    return grippers, cameras
+
+
+def apply_device_config(
+    grippers: dict[str, GripperSpec],
+    cameras: dict[str, CameraSpec],
+) -> tuple[dict[str, GripperSpec], dict[str, CameraSpec]]:
+    """Apply optional per-host device paths without changing source code."""
+
+    config_value = os.environ.get("TACCAP_DEVICE_CONFIG", "").strip()
+    if not config_value:
+        return grippers, cameras
+    config_path = Path(config_value).expanduser()
+    with config_path.open("r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+    if not isinstance(payload, dict):
+        raise ValueError(f"device config must contain a JSON object: {config_path}")
+
+    for side, values in payload.get("grippers", {}).items():
+        if side not in FALLBACK_GRIPPER_SPECS or not isinstance(values, dict):
+            LOG.warning("ignoring unknown gripper config entry: %s", side)
+            continue
+        current = grippers.get(side, FALLBACK_GRIPPER_SPECS[side])
+        grippers[side] = GripperSpec(
+            side=side,
+            serial_number=str(values.get("serial_number") or current.serial_number),
+            mcu_device=str(values.get("mcu_device") or current.mcu_device),
+            firmware_serial=str(values.get("firmware_serial") or current.firmware_serial or "") or None,
+        )
+
+    for name, values in payload.get("cameras", {}).items():
+        if name not in FALLBACK_CAMERA_SPECS or not isinstance(values, dict):
+            LOG.warning("ignoring unknown camera config entry: %s", name)
+            continue
+        current = cameras.get(name, FALLBACK_CAMERA_SPECS[name])
+        cameras[name] = CameraSpec(
+            name=name,
+            side=current.side,
+            kind=current.kind,
+            label=str(values.get("label") or current.label),
+            device=str(values.get("device") or current.device),
+            sdk_serial=str(values.get("sdk_serial") or current.sdk_serial or "") or None,
+        )
+
+    LOG.info("applied device configuration: %s", config_path)
     return grippers, cameras
 
 
@@ -1379,7 +1397,7 @@ input[type=range] { flex:1; min-width:180px; }
 </head>
 <body>
 <h1>TacCap 远程控制</h1>
-<div class="hint">0 = 完全闭合，1 = 完全张开。电机使能后需要持续心跳；连接中断约 5 秒会自动断使能。四路触觉由 .4 上的四个独立采集进程持续读取，网页发布目标 120 Hz，腕部相机保持 30 Hz；网页只接收最新帧，不会因某一路浏览器卡住而拖慢其它路。触觉输入保持原始 640×480，使用 xensesdk Sensor.OutputType.Rectify（SDK 参数 rectify_size=(400, 700)，标定矫正）。</div>
+<div class="hint">0 = 完全闭合，1 = 完全张开。电机使能后需要持续心跳；连接中断约 5 秒会自动断使能。四路触觉由设备端的四个独立采集进程持续读取，网页发布目标 120 Hz，腕部相机保持 30 Hz；网页只接收最新帧，不会因某一路浏览器卡住而拖慢其它路。触觉输入保持原始 640×480，使用 xensesdk Sensor.OutputType.Rectify（SDK 参数 rectify_size=(400, 700)，标定矫正）。</div>
 <section class="controls" id="controls"></section>
 <section class="cameras" id="cameras"></section>
 <script>
@@ -1533,7 +1551,7 @@ def make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                         {
                             "ok": True,
                             "uptime_s": round(time.time() - state.started_at, 3),
-                            "bind_policy": "loopback-only; use an SSH tunnel",
+                            "bind_policy": "direct LAN access; no built-in authentication",
                             "motor_lease_timeout_s": LEASE_TIMEOUT_S,
                             "tactile_mode": state.tactile_mode,
                             "camera_target_fps": CAMERA_STREAM_FPS,
@@ -1733,7 +1751,7 @@ def make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--ffmpeg", default="/usr/bin/ffmpeg")
     parser.add_argument("--log-level", default="INFO")
@@ -1746,8 +1764,6 @@ def main() -> int:
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(threadName)s %(message)s",
     )
-    if args.host not in {"127.0.0.1", "localhost", "::1"}:
-        raise SystemExit("refusing a non-loopback bind; use an SSH tunnel")
     if not os.path.isfile(args.ffmpeg):
         raise SystemExit(f"ffmpeg not found: {args.ffmpeg}")
 
@@ -1761,6 +1777,7 @@ def main() -> int:
         LOG.exception("xense.taccap import failed; motor control is unavailable: %s", exc)
 
     gripper_specs, camera_specs = discover_specs(taccap)
+    gripper_specs, camera_specs = apply_device_config(gripper_specs, camera_specs)
     LOG.info(
         "startup discovery: grippers=%s cameras=%s",
         sorted(gripper_specs),

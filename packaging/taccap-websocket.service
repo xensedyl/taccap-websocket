@@ -1,0 +1,17 @@
+[Unit]
+Description=TacCap WebSocket/HTTP camera and gripper service
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/taccap-websocket
+EnvironmentFile=-%h/taccap-websocket/config/taccap.env
+ExecStart=%h/taccap-websocket/taccap.sh run
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=15
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

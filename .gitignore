@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.log
+*.pid
+*.jpg
+*.jpeg
+*.png
+*.bak
+*.bak.*
+.venv/
+!.log/
+.log/*
+!.log/.gitkeep
+config/taccap.env
+config/devices.json
+.release

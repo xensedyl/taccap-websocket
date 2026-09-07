@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Command-line client for the TacCap bridge reached through an SSH tunnel."""
+"""Command-line client for a TacCap service on the local network."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import sys
 import time
@@ -13,8 +14,7 @@ import urllib.request
 from typing import Any
 
 
-# The normal deployment reaches the bridge through 127.0.0.1 after an SSH
-# local-forward.  Never let HTTP(S)_PROXY redirect those requests elsewhere.
+# Robot LAN addresses should never be redirected through HTTP(S)_PROXY.
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -38,7 +38,7 @@ def request(base: str, path: str, body: dict[str, Any] | None = None) -> Any:
         raise RuntimeError(f"HTTP {exc.code}: {message}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(
-            f"cannot reach {base}; is the SSH tunnel running? ({exc.reason})"
+            f"cannot reach {base}; check the target IP, port and service ({exc.reason})"
         ) from exc
 
 
@@ -55,7 +55,10 @@ def heartbeat_for(base: str, side: str, seconds: float) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base", default="http://127.0.0.1:8765")
+    parser.add_argument(
+        "--base",
+        default=os.environ.get("TACCAP_BASE_URL", "http://127.0.0.1:8765"),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("health")
     sub.add_parser("status")

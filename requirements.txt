@@ -1,0 +1,6 @@
+# Runtime dependencies for a fresh target device.
+# Proprietary/native wheels may need a private index or local wheel path.
+numpy>=1.24
+opencv-python-headless>=4.8
+xensesdk
+taccap-gripper

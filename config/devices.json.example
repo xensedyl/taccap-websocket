@@ -1,0 +1,38 @@
+{
+  "grippers": {
+    "left": {
+      "serial_number": "CH343_OR_MCU_SERIAL",
+      "mcu_device": "/dev/serial/by-id/usb-...-if02",
+      "firmware_serial": "OPTIONAL_FIRMWARE_SERIAL"
+    },
+    "right": {
+      "serial_number": "CH343_OR_MCU_SERIAL",
+      "mcu_device": "/dev/serial/by-id/usb-...-if02",
+      "firmware_serial": "OPTIONAL_FIRMWARE_SERIAL"
+    }
+  },
+  "cameras": {
+    "left_wrist": {
+      "device": "/dev/v4l/by-id/usb-...-video-index0"
+    },
+    "left_tactile_left": {
+      "device": "/dev/v4l/by-id/usb-...-video-index0",
+      "sdk_serial": "GSPS..."
+    },
+    "left_tactile_right": {
+      "device": "/dev/v4l/by-id/usb-...-video-index0",
+      "sdk_serial": "GSPS..."
+    },
+    "right_wrist": {
+      "device": "/dev/v4l/by-id/usb-...-video-index0"
+    },
+    "right_tactile_left": {
+      "device": "/dev/v4l/by-id/usb-...-video-index0",
+      "sdk_serial": "GSPS..."
+    },
+    "right_tactile_right": {
+      "device": "/dev/v4l/by-id/usb-...-video-index0",
+      "sdk_serial": "GSPS..."
+    }
+  }
+}
