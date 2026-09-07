@@ -9,7 +9,8 @@ Install the TacCap service on the current machine.
 
 Options:
   --install-dir DIR       Installation directory (default: $HOME/taccap-websocket)
-  --python PATH           Base Python executable for the virtualenv (default: python3)
+  --python PATH           Base Python executable for the virtualenv
+  --bootstrap-python      Install a private Python 3.12 with uv when needed
   --env-script PATH       SDK environment script sourced before startup
   --wheel-dir DIR         Directory containing private SDK wheels
   --with-deps             Create .venv and install requirements.txt
@@ -28,6 +29,7 @@ if [[ -n "${TACCAP_BASE_PYTHON:-}" ]]; then
     python_explicit=1
 fi
 wheel_dir="${TACCAP_WHEEL_DIR:-}"
+bootstrap_python=0
 env_script=""
 env_script_explicit=0
 with_deps=0
@@ -47,6 +49,10 @@ while (($#)); do
             base_python="$2"
             python_explicit=1
             shift 2
+            ;;
+        --bootstrap-python)
+            bootstrap_python=1
+            shift
             ;;
         --env-script)
             (($# >= 2)) || { echo "missing argument for --env-script" >&2; exit 2; }
@@ -109,8 +115,20 @@ if ((install_system_deps)); then
         python3 python3-pip python3-venv rsync v4l-utils
 fi
 
-if ! command -v "$base_python" >/dev/null 2>&1 && [[ ! -x "$base_python" ]]; then
-    echo "Python executable not found: $base_python" >&2
+if ((bootstrap_python)); then
+    command -v uv >/dev/null 2>&1 || {
+        echo "uv is required for --bootstrap-python; install it from https://astral.sh/uv" >&2
+        exit 1
+    }
+    python_home="$install_dir/.runtime/python"
+    uv python install 3.12 --install-dir "$python_home"
+    base_python="$(find "$python_home" -type f -path '*/bin/python' -print -quit)"
+    [[ -x "$base_python" ]] || {
+        echo "uv installed Python but no executable was found under $python_home" >&2
+        exit 1
+    }
+elif ! command -v "$base_python" >/dev/null 2>&1 && [[ ! -x "$base_python" ]]; then
+    echo "Python executable not found: $base_python (use --bootstrap-python or --python PATH)" >&2
     exit 1
 fi
 if ! "$base_python" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
@@ -213,7 +231,12 @@ if ((with_deps)); then
         "$install_dir/.venv/bin/python" -m pip install \
             --no-deps --no-index --find-links "$wheel_dir" xensesdk taccap-gripper
     fi
-    "$install_dir/.venv/bin/python" -m pip install -r "$install_dir/requirements.txt"
+    if [[ -n "$wheel_dir" ]]; then
+        "$install_dir/.venv/bin/python" -m pip install \
+            --find-links "$wheel_dir" -r "$install_dir/requirements.txt"
+    else
+        "$install_dir/.venv/bin/python" -m pip install -r "$install_dir/requirements.txt"
+    fi
     python_bin="$install_dir/.venv/bin/python"
     tmp_config="$(mktemp)"
     awk -v value="$python_bin" '

@@ -10,6 +10,7 @@ Upload this checkout to a target machine and run install.sh there.
 Options:
   --install-dir DIR       Remote installation directory
   --python PATH           Base Python executable on the remote device
+  --bootstrap-python      Install a private Python 3.12 with uv on the remote
   --env-script PATH       SDK environment script on the remote device
   --wheel-dir DIR         Local directory containing private SDK wheels
   --no-deps               Do not create a virtualenv or install Python packages
@@ -24,6 +25,7 @@ project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 target=""
 install_dir=""
 base_python=""
+bootstrap_python=0
 wheel_dir=""
 env_script=""
 with_deps=1
@@ -52,6 +54,10 @@ while (($#)); do
             (($# >= 2)) || { echo "missing argument for --python" >&2; exit 2; }
             base_python="$2"
             shift 2
+            ;;
+        --bootstrap-python)
+            bootstrap_python=1
+            shift
             ;;
         --env-script)
             (($# >= 2)) || { echo "missing argument for --env-script" >&2; exit 2; }
@@ -151,6 +157,9 @@ if [[ -n "$install_dir" ]]; then
 fi
 if [[ -n "$base_python" ]]; then
     remote_cmd+=" --python $(shell_quote "$base_python")"
+fi
+if ((bootstrap_python)); then
+    remote_cmd+=" --bootstrap-python"
 fi
 if [[ -n "$env_script" ]]; then
     remote_cmd+=" --env-script $(shell_quote "$env_script")"

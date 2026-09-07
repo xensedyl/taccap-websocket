@@ -37,6 +37,24 @@ cd /home/xense/tron2/taccap-websocket
 ./deploy.sh user@NEW_DEVICE_IP --install-system-deps --enable-systemd
 ~~~
 
+新设备没有 Python 3.12、`TACCAP_PYTHON` 或旧设备激活脚本时，使用自动引导模式：
+
+~~~bash
+./deploy.sh user@NEW_DEVICE_IP \
+  --bootstrap-python \
+  --install-system-deps \
+  --enable-systemd
+~~~
+
+该模式需要目标设备能访问网络，并预先安装 `uv`。它会将 Python 3.12 放在项目的
+`.runtime/python` 下。若目标设备没有 `uv`，可先执行官方安装命令：
+
+~~~bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+~~~
+
+若环境不能联网，则应准备 Python 3.12 或使用 `--wheel-dir` 上传专有 SDK wheel。
+
 deploy.sh 会完成以下工作：
 
 1. 以当前 Git 提交为版本打包（不会上传 .git、日志、PID、虚拟环境或本地配置）；
@@ -92,8 +110,8 @@ install.sh 也支持只安装、不启动：
 ./install.sh --with-deps --no-start
 ~~~
 
-目标设备需要 Python 3.10 或更新版本。Ubuntu 20.04 的系统 Python 通常是 3.8，
-此时应先准备 Python 3.12，再把解释器路径传给部署脚本：
+目标设备需要 Python 3.10 或更新版本。Ubuntu 20.04 的系统 Python 通常是 3.8；
+也可以显式指定已经安装好的 Python 3.12：
 
 ~~~bash
 ./deploy.sh user@NEW_DEVICE_IP \

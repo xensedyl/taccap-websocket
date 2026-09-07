@@ -15,6 +15,12 @@ if [[ -n "${TACCAP_ENV_SCRIPT:-}" ]]; then
     # shellcheck disable=SC1090
     source "$TACCAP_ENV_SCRIPT" >/dev/null
 fi
+if [[ -n "${TACCAP_PYTHONPATH:-}" ]]; then
+    export PYTHONPATH="$TACCAP_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}"
+fi
+if [[ -n "${TACCAP_LD_LIBRARY_PATH:-}" ]]; then
+    export LD_LIBRARY_PATH="$TACCAP_LD_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 
 python_bin="${TACCAP_PYTHON:-python3}"
 bind_host="${TACCAP_BIND_HOST:-0.0.0.0}"
