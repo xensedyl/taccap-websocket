@@ -51,6 +51,16 @@ esac
 command -v curl >/dev/null 2>&1 || { echo "curl is required on target" >&2; exit 1; }
 command -v ffmpeg >/dev/null 2>&1 || { echo "ffmpeg is required on target" >&2; exit 1; }
 
+# Stop only the existing TacCap service in the requested installation
+# directory before replacing its source/runtime.  This also handles the old
+# flat layout used by early releases, so an upgrade cannot leave an old
+# process listening on port 8765.
+if [[ -x "$install_dir/scripts/taccap.sh" ]]; then
+    "$install_dir/scripts/taccap.sh" stop >/dev/null 2>&1 || true
+elif [[ -x "$install_dir/taccap.sh" ]]; then
+    "$install_dir/taccap.sh" stop >/dev/null 2>&1 || true
+fi
+
 echo "Verifying offline bundle: $offline_dir"
 awk 'BEGIN { hashes=0 } /^sha256:/ { hashes=1; next } hashes && NF { print }' \
     "$offline_dir/manifest.txt" | (cd "$offline_dir" && sha256sum -c -)
