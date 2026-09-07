@@ -1,0 +1,1789 @@
+#!/usr/bin/env python3
+"""TacCap remote bridge for the computer at 10.192.1.4.
+
+The server intentionally binds to loopback by default.  Reach it from the
+operator computer through an SSH local-forward instead of exposing motor
+control on the LAN.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import deque
+import contextlib
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import re
+import select
+import signal
+import socket
+import subprocess
+import struct
+import sys
+import threading
+import time
+import urllib.parse
+from dataclasses import dataclass
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+
+LOG = logging.getLogger("taccap-bridge")
+
+LEASE_TIMEOUT_S = 5.0
+MAX_VELOCITY_RAD_S = 0.60
+MAX_TORQUE_NM = 0.25
+CLOSE_CONFIRM_THRESHOLD = 0.05
+# The tactile sensors negotiate their native MJPG/SDK stream at up to 120 Hz.
+# Keep the calibrated 640x480 input and publish every available Rectify sample
+# during this experiment; wrist cameras remain on the less bandwidth-hungry
+# 30 Hz path below.
+SDK_TACTILE_FPS = 120.0
+# ``xensesdk`` takes rectify_size in (width, height) order.  The returned
+# NumPy image is normally (height, width, channels), i.e. (700, 400, 3).
+# Keep these constants explicit so the bridge cannot silently fall back to the
+# old 640x480 Raw frame contract.
+TACTILE_RECTIFY_WIDTH = 400
+TACTILE_RECTIFY_HEIGHT = 700
+TACTILE_RECTIFY_SHAPES = {
+    (TACTILE_RECTIFY_HEIGHT, TACTILE_RECTIFY_WIDTH, 3),
+    (TACTILE_RECTIFY_WIDTH, TACTILE_RECTIFY_HEIGHT, 3),
+}
+CAMERA_STREAM_FPS = 30.0
+TACTILE_STREAM_FPS = 120.0
+CAMERA_JPEG_QUALITY = max(
+    60,
+    min(95, int(os.environ.get("TACCAP_CAMERA_JPEG_QUALITY", "85"))),
+)
+FRAME_STALE_AFTER_S = 3.0
+USB_BANDWIDTH_ERROR = (
+    "USB isochronous bandwidth exhausted (VIDIOC_STREAMON/ENOSPC); "
+    "move one gripper USB hub to another root controller"
+)
+
+MOTOR_STATUS_BITS = {
+    0x0001: "enabled",
+    0x0002: "fault",
+    0x0004: "stalled",
+    0x0008: "over_temp",
+    0x0010: "over_current",
+    0x0020: "over_voltage",
+    0x0040: "under_voltage",
+    0x0080: "encoder_error",
+}
+
+
+@dataclass(frozen=True)
+class GripperSpec:
+    side: str
+    serial_number: str
+    mcu_device: str
+    firmware_serial: str | None = None
+
+
+@dataclass(frozen=True)
+class CameraSpec:
+    name: str
+    side: str
+    kind: str
+    label: str
+    device: str
+    sdk_serial: str | None = None
+
+
+# These are only a last-resort compatibility map.  At startup the service
+# discovers the currently attached firmware/USB serials and replaces this map;
+# keeping a fallback means the HTTP API still exposes a useful ``unavailable``
+# entry while a device is being replugged.
+FALLBACK_GRIPPER_SPECS = {
+    "left": GripperSpec(
+        side="left",
+        serial_number="5C96089218",
+        mcu_device=(
+            "/dev/serial/by-id/"
+            "usb-1a86_USB_Dual_Serial_5C96089218-if02"
+        ),
+    ),
+    "right": GripperSpec(
+        side="right",
+        serial_number="5C96089216",
+        mcu_device=(
+            "/dev/serial/by-id/"
+            "usb-1a86_USB_Dual_Serial_5C96089216-if02"
+        ),
+    ),
+}
+
+FALLBACK_CAMERA_SPECS = {
+    "left_wrist": CameraSpec(
+        "left_wrist",
+        "left",
+        "wrist",
+        "左夹爪相机",
+        "/dev/v4l/by-id/usb-LRCP_imx385_XCA28Z0017s_XCA28Z0017s-video-index0",
+    ),
+    "left_tactile_left": CameraSpec(
+        "left_tactile_left",
+        "left",
+        "tactile_raw",
+        "左夹爪 · 左指触觉（标定矫正）",
+        (
+            "/dev/v4l/by-id/"
+            "usb-Xense_Robotics_Co_._Ltd._GSPS01A30Z0043_"
+            "GSPS01A30Z0043-video-index0"
+        ),
+        "GSPS01A30Z0043",
+    ),
+    "left_tactile_right": CameraSpec(
+        "left_tactile_right",
+        "left",
+        "tactile_raw",
+        "左夹爪 · 右指触觉（标定矫正）",
+        (
+            "/dev/v4l/by-id/"
+            "usb-Xense_Robotics_Co_._Ltd._GSPS01A30Z0044_"
+            "GSPS01A30Z0044-video-index0"
+        ),
+        "GSPS01A30Z0044",
+    ),
+    "right_wrist": CameraSpec(
+        "right_wrist",
+        "right",
+        "wrist",
+        "右夹爪相机",
+        "/dev/v4l/by-id/usb-LRCP_imx385_XCA28Z0016s_XCA28Z0016s-video-index0",
+    ),
+    "right_tactile_left": CameraSpec(
+        "right_tactile_left",
+        "right",
+        "tactile_raw",
+        "右夹爪 · 左指触觉（标定矫正）",
+        (
+            "/dev/v4l/by-id/"
+            "usb-Xense_Robotics_Co_._Ltd._GSPS01A30Z0041_"
+            "GSPS01A30Z0041-video-index0"
+        ),
+        "GSPS01A30Z0041",
+    ),
+    "right_tactile_right": CameraSpec(
+        "right_tactile_right",
+        "right",
+        "tactile_raw",
+        "右夹爪 · 右指触觉（标定矫正）",
+        (
+            "/dev/v4l/by-id/"
+            "usb-Xense_Robotics_Co_._Ltd._GSPS01A30Z0042_"
+            "GSPS01A30Z0042-video-index0"
+        ),
+        "GSPS01A30Z0042",
+    ),
+}
+
+
+_USB_DEVICE_RE = re.compile(r"\d+-\d+(?:\.\d+)*")
+_WRIST_SERIAL_RE = re.compile(r"(XCA[A-Za-z0-9]+)", re.IGNORECASE)
+_TACTILE_SERIAL_RE = re.compile(r"(GSPS[A-Za-z0-9]+)", re.IGNORECASE)
+_TRAILING_DIGITS_RE = re.compile(r"(\d+)(?:[^0-9]*)$")
+
+
+def _class_device_path(path: str, class_name: str) -> str | None:
+    """Resolve a V4L2/TTY node to its physical USB sysfs device path."""
+
+    try:
+        node = Path(os.path.realpath(path)).name
+        target = Path(f"/sys/class/{class_name}/{node}/device")
+        if not target.exists():
+            return None
+        return str(target.resolve())
+    except (OSError, RuntimeError):
+        return None
+
+
+def _usb_hub_key(path: str, class_name: str) -> tuple[str, ...] | None:
+    """Return the USB parent chain shared by a gripper and its cameras.
+
+    The final token identifies the individual device (MCU or camera), while
+    all preceding tokens identify the external hub chain.  For example the
+    current machine reports ``3-1/3-1.1`` for the left MCU and
+    ``3-1/3-1.3`` for its wrist camera, hence both resolve to ``("3-1",)``.
+    """
+
+    target = _class_device_path(path, class_name)
+    if target is None:
+        return None
+    # A class device path ends in ``<usb-device>:<interface>``; without
+    # removing that suffix the regex sees the same USB token twice and treats
+    # the individual camera/MCU as part of the shared hub key.
+    target = re.sub(r"/[^/]+:\d+\.\d+$", "", target)
+    tokens = tuple(_USB_DEVICE_RE.findall(target))
+    return tokens[:-1] if tokens else None
+
+
+def _by_id_video_entries() -> list[tuple[str, str, tuple[str, ...] | None]]:
+    """Enumerate stable V4L2 ``by-id`` index-0 entries.
+
+    Returns ``(basename, path, hub_key)``.  Index 1 is the same physical UVC
+    device's metadata node and must not be opened as a second stream.
+    """
+
+    result: list[tuple[str, str, tuple[str, ...] | None]] = []
+    root = Path("/dev/v4l/by-id")
+    try:
+        paths = sorted(root.glob("*video-index0"))
+    except OSError:
+        return result
+    for path in paths:
+        result.append((path.name, str(path), _usb_hub_key(str(path), "video4linux")))
+    return result
+
+
+def _serial_from_name(pattern: re.Pattern[str], name: str) -> str | None:
+    match = pattern.search(name)
+    return match.group(1) if match else None
+
+
+def _finger_from_serial(serial: str) -> str | None:
+    """Fleet convention: odd trailing sensor number is the left jaw."""
+
+    match = _TRAILING_DIGITS_RE.search(serial)
+    if not match:
+        return None
+    return "left" if int(match.group(1)) % 2 else "right"
+
+
+def _firmware_wrist_serial(firmware_serial: str | None) -> str | None:
+    """Convert ``TCGU01A28Z0017s`` to the UVC wrist serial ``XCA28Z0017s``."""
+
+    if not firmware_serial:
+        return None
+    value = str(firmware_serial)
+    # Current firmware starts with TCGU01; retain a conservative fallback for
+    # future revisions by taking the suffix after the first six characters.
+    suffix = value[7:] if value.upper().startswith("TCGU01A") else value
+    return f"XCA{suffix}" if suffix else None
+
+
+def discover_specs(taccap_module: Any | None) -> tuple[dict[str, GripperSpec], dict[str, CameraSpec]]:
+    """Discover both grippers and their six cameras on the current USB tree.
+
+    The SDK is authoritative for left/right assignment of the MCU.  V4L2
+    ``by-id`` names identify each camera, and the sysfs hub chain associates it
+    with the corresponding gripper.  This avoids stale device numbers after a
+    reboot or replug while retaining deterministic ``<side>_tactile_left`` /
+    ``right`` names.
+    """
+
+    grippers: dict[str, GripperSpec] = {}
+    if taccap_module is not None:
+        for side, finder_name in (("left", "find_left"), ("right", "find_right")):
+            try:
+                endpoint = getattr(taccap_module, finder_name)()
+                mcu = str(endpoint.mcu_device)
+                mcu_serial = str(getattr(endpoint, "mcu_serial", "") or "")
+                firmware_serial = str(
+                    getattr(endpoint, "firmware_sn", getattr(endpoint, "firmware_serial", "")) or ""
+                )
+                serial = mcu_serial or str(getattr(endpoint, "ch343_sn", "") or "") or firmware_serial
+                grippers[side] = GripperSpec(
+                    side=side,
+                    serial_number=serial,
+                    mcu_device=mcu,
+                    firmware_serial=firmware_serial or None,
+                )
+                LOG.info(
+                    "discovered %s gripper: mcu=%s mcu_serial=%s firmware=%s",
+                    side,
+                    mcu,
+                    serial,
+                    firmware_serial or "?",
+                )
+            except Exception as exc:
+                LOG.warning("could not discover %s gripper through SDK: %s", side, exc)
+
+    # Preserve the public two-side schema while a side is absent/replugging.
+    for side, fallback in FALLBACK_GRIPPER_SPECS.items():
+        grippers.setdefault(side, fallback)
+
+    entries = _by_id_video_entries()
+    cameras: dict[str, CameraSpec] = {}
+    for side in ("left", "right"):
+        gripper = grippers[side]
+        hub = _usb_hub_key(gripper.mcu_device, "tty")
+        side_entries = [entry for entry in entries if hub is not None and entry[2] == hub]
+        wrist_target = _firmware_wrist_serial(gripper.firmware_serial)
+        wrist_entry = None
+        if wrist_target:
+            wrist_entry = next(
+                (
+                    entry
+                    for entry in side_entries
+                    if (serial := _serial_from_name(_WRIST_SERIAL_RE, entry[0]))
+                    and serial.lower() == wrist_target.lower()
+                ),
+                None,
+            )
+        if wrist_entry is None:
+            wrist_entry = next(
+                (entry for entry in side_entries if "LRCP_imx385" in entry[0]),
+                None,
+            )
+        if wrist_entry is not None:
+            cameras[f"{side}_wrist"] = CameraSpec(
+                f"{side}_wrist",
+                side,
+                "wrist",
+                f"{'左' if side == 'left' else '右'}夹爪相机",
+                wrist_entry[1],
+            )
+
+        tactile_entries: list[tuple[str, str, tuple[str, ...] | None, str]] = []
+        for entry in side_entries:
+            serial = _serial_from_name(_TACTILE_SERIAL_RE, entry[0])
+            if serial:
+                tactile_entries.append((*entry, serial))
+        # Sort by serial as a deterministic fallback; the finger assignment is
+        # still based on parity, never enumeration order.
+        for serial, finger in sorted(
+            ((item[3], _finger_from_serial(item[3])) for item in tactile_entries),
+            key=lambda item: item[0],
+        ):
+            if finger is None:
+                continue
+            item = next(item for item in tactile_entries if item[3] == serial)
+            name = f"{side}_tactile_{finger}"
+            cameras[name] = CameraSpec(
+                name,
+                side,
+                "tactile_raw",
+                f"{'左' if side == 'left' else '右'}夹爪 · {'左' if finger == 'left' else '右'}指触觉（标定矫正）",
+                item[1],
+                serial,
+            )
+
+        LOG.info(
+            "camera discovery for %s: hub=%s wrist=%s tactile=%s",
+            side,
+            hub,
+            cameras.get(f"{side}_wrist", CameraSpec("", "", "", "", "")).device
+            if f"{side}_wrist" in cameras
+            else "missing",
+            sorted(name for name in cameras if name.startswith(f"{side}_tactile_")),
+        )
+
+    # Fill only missing logical names with the compatibility map.  Existing
+    # discovered entries always win, including after a device-number change.
+    for name, fallback in FALLBACK_CAMERA_SPECS.items():
+        cameras.setdefault(name, fallback)
+    return grippers, cameras
+
+
+class ApiError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+class GripperController:
+    """Own one serial transport and serialize all commands sent over it."""
+
+    def __init__(self, spec: GripperSpec, taccap_module: Any):
+        self.spec = spec
+        self.taccap = taccap_module
+        self.lock = threading.RLock()
+        self.gripper: Any | None = None
+        self.config: Any | None = None
+        self.armed = False
+        self.last_lease = 0.0
+        self.target_position: float | None = None
+        self.last_error: str | None = None
+        self.last_connect_attempt = 0.0
+        self.status_condition = threading.Condition()
+        self.latest_status: dict[str, Any] | None = None
+        self.status_sequence = 0
+        self.status_stop = threading.Event()
+        self.status_thread: threading.Thread | None = None
+        if self.connect():
+            self._start_status_reader()
+
+    def _stop_transport_locked(self) -> None:
+        if self.gripper is None:
+            return
+        try:
+            self.gripper.transport.stop()
+        except Exception:
+            LOG.exception("%s transport stop failed", self.spec.side)
+        self.gripper = None
+        self.config = None
+        self.armed = False
+
+    def _connect_locked(self) -> bool:
+        self.last_connect_attempt = time.monotonic()
+        self._stop_transport_locked()
+        try:
+            gripper = self.taccap.FollowerGripper(
+                self.spec.mcu_device,
+                baudrate=3_000_000,
+                ack_timeout_ms=1000,
+                max_retries=2,
+                open_cameras=False,
+            )
+            config = gripper.get_gripper_config(500)
+            # A bridge restart must never inherit an enabled actuator.
+            gripper.motor.disable()
+            self.gripper = gripper
+            self.config = config
+            self.armed = False
+            self.target_position = None
+            self.last_error = None
+            LOG.info(
+                "%s gripper connected: serial=%s config=%r",
+                self.spec.side,
+                self.spec.serial_number,
+                config,
+            )
+            return True
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            LOG.exception("%s gripper connection failed", self.spec.side)
+            try:
+                if "gripper" in locals():
+                    gripper.transport.stop()
+            except Exception:
+                pass
+            self.gripper = None
+            self.config = None
+            self.armed = False
+            return False
+
+    def connect(self) -> bool:
+        with self.lock:
+            if self.gripper is not None:
+                return True
+            connected = self._connect_locked()
+        if connected:
+            self._start_status_reader()
+        return connected
+
+    def _start_status_reader(self) -> None:
+        if self.status_thread is not None and self.status_thread.is_alive():
+            return
+        self.status_stop.clear()
+        self.status_thread = threading.Thread(
+            target=self._status_reader_loop,
+            name=f"status-{self.spec.side}",
+            daemon=True,
+        )
+        self.status_thread.start()
+
+    def _status_reader_loop(self) -> None:
+        """Read motor feedback once and fan the cached state out to clients.
+
+        Both LeRobot side clients poll at 30 Hz.  Performing a serial request in
+        every HTTP handler would serialize those requests behind the MCU and
+        make observation latency depend on network fan-out.  One producer per
+        motor keeps serial ownership local and makes status GETs non-blocking.
+        """
+
+        period = 1.0 / 100.0
+        next_read = time.monotonic()
+        while not self.status_stop.is_set():
+            try:
+                with self.lock:
+                    gripper = self.gripper
+                    if gripper is None:
+                        break
+                    sample = gripper.motor.read_status(500)
+                    raw_status = int(sample.status)
+                    hardware_enabled = bool(raw_status & 0x0001)
+                    if self.armed and not hardware_enabled:
+                        self.armed = False
+                        self.last_lease = 0.0
+                    normalized = min(1.0, max(0.0, float(gripper.rad_to_pos(float(sample.actual_pos)))))
+                    cfg = self.config
+                    remaining = (
+                        max(0.0, LEASE_TIMEOUT_S - (time.monotonic() - self.last_lease))
+                        if self.armed
+                        else 0.0
+                    )
+                    value = {
+                        "side": self.spec.side,
+                        "available": True,
+                        "serial_number": self.spec.serial_number,
+                        "firmware_serial": self.spec.firmware_serial,
+                        "mcu_device": self.spec.mcu_device,
+                        "armed": self.armed,
+                        "enabled": hardware_enabled,
+                        "lease_remaining_s": round(remaining, 3),
+                        "position": normalized,
+                        "raw_position_rad": float(sample.actual_pos),
+                        "velocity_rad_s": float(sample.actual_vel),
+                        "torque_nm": float(sample.actual_torque),
+                        "motor_temp_c": float(sample.motor_temp_c),
+                        "status": raw_status,
+                        "status_flags": [
+                            name for bit, name in MOTOR_STATUS_BITS.items() if raw_status & bit
+                        ],
+                        "target_position": self.target_position,
+                        "firmware_target_rad": float(sample.target_pos),
+                        "control_mode": int(sample.control_mode),
+                        "config": {
+                            "flags": int(cfg.flags),
+                            "max_open_rad": float(cfg.max_open_rad),
+                            "min_open_rad": float(cfg.min_open_rad),
+                            "reverse": bool(int(cfg.flags) & 0x0002),
+                        },
+                        "limits": {
+                            "max_velocity_rad_s": MAX_VELOCITY_RAD_S,
+                            "max_torque_nm": MAX_TORQUE_NM,
+                        },
+                        "last_error": None,
+                    }
+                    self.last_error = None
+                with self.status_condition:
+                    self.latest_status = value
+                    self.status_sequence += 1
+                    self.status_condition.notify_all()
+            except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                if not self.status_stop.wait(0.05):
+                    LOG.debug("%s status read failed: %s", self.spec.side, self.last_error)
+            next_read += period
+            delay = next_read - time.monotonic()
+            if delay > 0:
+                self.status_stop.wait(delay)
+            elif delay < -period:
+                next_read = time.monotonic()
+
+    def _require_gripper_locked(self) -> Any:
+        if self.gripper is None:
+            if time.monotonic() - self.last_connect_attempt >= 2.0:
+                connected = self._connect_locked()
+                if connected:
+                    # ``enable``/``position`` can be the first request after a
+                    # transient USB replug.  That path calls this helper
+                    # directly (rather than ``connect``), so explicitly
+                    # restart the cached status producer here as well.
+                    self._start_status_reader()
+        if self.gripper is None:
+            raise ApiError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                f"{self.spec.side} gripper unavailable: {self.last_error}",
+            )
+        return self.gripper
+
+    def enable(self) -> dict[str, Any]:
+        with self.lock:
+            gripper = self._require_gripper_locked()
+            try:
+                gripper.motor.clear_fault()
+                gripper.motor.enable()
+                self.armed = True
+                self.last_lease = time.monotonic()
+                self.last_error = None
+            except Exception as exc:
+                self.armed = False
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                raise ApiError(HTTPStatus.CONFLICT, self.last_error) from exc
+        return self.status()
+
+    def disable(self, reason: str = "operator") -> dict[str, Any]:
+        with self.lock:
+            gripper = self._require_gripper_locked()
+            try:
+                gripper.motor.disable()
+                LOG.info("%s gripper disabled (%s)", self.spec.side, reason)
+            except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                raise ApiError(HTTPStatus.CONFLICT, self.last_error) from exc
+            finally:
+                self.armed = False
+                self.last_lease = 0.0
+        return self.status()
+
+    def heartbeat(self) -> dict[str, Any]:
+        with self.lock:
+            if not self.armed:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    f"{self.spec.side} gripper is not enabled by this service",
+                )
+            self.last_lease = time.monotonic()
+        return {"side": self.spec.side, "lease_remaining_s": LEASE_TIMEOUT_S}
+
+    def set_position(self, position: float, confirm_close: bool = False) -> dict[str, Any]:
+        if not math.isfinite(position) or position < 0.0 or position > 1.0:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "position must be within [0, 1]")
+        if position <= CLOSE_CONFIRM_THRESHOLD and not confirm_close:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "fully closing requires JSON field confirm_close=true",
+            )
+
+        with self.lock:
+            gripper = self._require_gripper_locked()
+            if not self.armed:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    f"enable the {self.spec.side} gripper before commanding it",
+                )
+            try:
+                target_rad = float(gripper.pos_to_rad(position))
+                gripper.motor.set_position(
+                    target_rad,
+                    MAX_VELOCITY_RAD_S,
+                    MAX_TORQUE_NM,
+                )
+                self.target_position = position
+                self.last_lease = time.monotonic()
+                self.last_error = None
+                LOG.info(
+                    "%s target position=%.3f raw=%.4f rad",
+                    self.spec.side,
+                    position,
+                    target_rad,
+                )
+            except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                raise ApiError(HTTPStatus.CONFLICT, self.last_error) from exc
+        return self.status()
+
+    def watchdog(self, now: float) -> None:
+        with self.lock:
+            if not self.armed or now - self.last_lease <= LEASE_TIMEOUT_S:
+                return
+            try:
+                if self.gripper is not None:
+                    self.gripper.motor.disable()
+                LOG.warning("%s watchdog expired; motor disabled", self.spec.side)
+            except Exception as exc:
+                self.last_error = f"watchdog disable failed: {type(exc).__name__}: {exc}"
+                LOG.exception("%s", self.last_error)
+            finally:
+                self.armed = False
+                self.last_lease = 0.0
+
+    def status(self) -> dict[str, Any]:
+        with self.status_condition:
+            value = dict(self.latest_status) if self.latest_status is not None else None
+        if value is not None:
+            with self.lock:
+                value["armed"] = self.armed
+                value["target_position"] = self.target_position
+                value["lease_remaining_s"] = round(
+                    max(0.0, LEASE_TIMEOUT_S - (time.monotonic() - self.last_lease))
+                    if self.armed
+                    else 0.0,
+                    3,
+                )
+                value["last_error"] = self.last_error
+            return value
+        with self.lock:
+            if self.gripper is None and time.monotonic() - self.last_connect_attempt >= 2.0:
+                connected = self._connect_locked()
+            else:
+                connected = self.gripper is not None
+        if connected:
+            self._start_status_reader()
+        return self._unavailable(self.last_error or "waiting for first motor status")
+
+    def _unavailable(self, error: str) -> dict[str, Any]:
+        return {
+            "side": self.spec.side,
+            "available": False,
+            "serial_number": self.spec.serial_number,
+            "mcu_device": self.spec.mcu_device,
+            "armed": self.armed,
+            "enabled": False,
+            "lease_remaining_s": 0.0,
+            "last_error": error,
+        }
+
+    def close(self) -> None:
+        self.status_stop.set()
+        thread = self.status_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        self.status_thread = None
+        with self.lock:
+            if self.gripper is not None:
+                try:
+                    self.gripper.motor.disable()
+                except Exception:
+                    LOG.exception("%s shutdown disable failed", self.spec.side)
+            self.armed = False
+            self._stop_transport_locked()
+
+
+class FrameSource:
+    """Thread-safe latest-frame cache shared by all HTTP clients.
+
+    A camera is captured exactly once by its producer thread.  HTTP handlers
+    only wait for a sequence number and copy the newest JPEG; a slow browser
+    can therefore drop old frames without back-pressuring the USB reader.
+    """
+
+    def __init__(self, spec: CameraSpec):
+        self.spec = spec
+        self.condition = threading.Condition()
+        self.latest_frame: bytes | None = None
+        self.sequence = 0
+        self.frame_count = 0
+        self.last_frame_monotonic = 0.0
+        self.last_error: str | None = None
+        self.stop_event = threading.Event()
+        self.client_count = 0
+        self._publish_times: deque[float] = deque(maxlen=90)
+
+    def _publish(self, frame: bytes) -> None:
+        now = time.monotonic()
+        with self.condition:
+            self.latest_frame = frame
+            self.sequence += 1
+            self.frame_count += 1
+            self.last_frame_monotonic = now
+            self._publish_times.append(now)
+            self.last_error = None
+            self.condition.notify_all()
+
+    def latest(self) -> tuple[int, bytes] | None:
+        with self.condition:
+            if self.latest_frame is None:
+                return None
+            return self.sequence, self.latest_frame
+
+    def wait_for_frame(
+        self, timeout: float = 5.0, after_sequence: int | None = None
+    ) -> tuple[int, bytes] | None:
+        deadline = time.monotonic() + max(0.05, timeout)
+        with self.condition:
+            while (
+                self.latest_frame is None
+                or (after_sequence is not None and self.sequence <= after_sequence)
+            ) and not self.stop_event.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self.condition.wait(remaining)
+            if self.latest_frame is None:
+                return None
+            return self.sequence, self.latest_frame
+
+    # Keep the old method name for the CLI and any external scripts.
+    def capture_once(
+        self, timeout: float = 5.0, after_sequence: int | None = None
+    ) -> tuple[int, bytes] | None:
+        return self.wait_for_frame(timeout, after_sequence)
+
+    def _source_fps(self) -> float | None:
+        with self.condition:
+            if len(self._publish_times) < 2:
+                return None
+            elapsed = self._publish_times[-1] - self._publish_times[0]
+            if elapsed <= 0:
+                return None
+            return (len(self._publish_times) - 1) / elapsed
+
+    def _base_status(self) -> dict[str, Any]:
+        with self.condition:
+            age = (
+                time.monotonic() - self.last_frame_monotonic
+                if self.last_frame_monotonic
+                else None
+            )
+            frame_count = self.frame_count
+            client_count = self.client_count
+            last_error = self.last_error
+            source_fps = None
+            if len(self._publish_times) >= 2:
+                elapsed = self._publish_times[-1] - self._publish_times[0]
+                if elapsed > 0 and age is not None and age < FRAME_STALE_AFTER_S:
+                    source_fps = round((len(self._publish_times) - 1) / elapsed, 2)
+        stream_fps = TACTILE_STREAM_FPS if self.spec.kind == "tactile_raw" else CAMERA_STREAM_FPS
+        return {
+            "name": self.spec.name,
+            "side": self.spec.side,
+            "kind": self.spec.kind,
+            "label": self.spec.label,
+            "device": self.spec.device,
+            "available": (
+                self.latest_frame is not None
+                and age is not None
+                and age < FRAME_STALE_AFTER_S
+            ),
+            "frame_count": frame_count,
+            "source_fps": source_fps,
+            "last_frame_age_s": round(age, 3) if age is not None else None,
+            "clients": client_count,
+            "last_error": last_error,
+            "snapshot_url": f"/camera/{self.spec.name}.jpg",
+            "stream_url": f"/camera/{self.spec.name}.mjpg?fps={stream_fps:g}",
+        }
+
+    def register_client(self) -> None:
+        with self.condition:
+            self.client_count += 1
+
+    def unregister_client(self) -> None:
+        with self.condition:
+            self.client_count = max(0, self.client_count - 1)
+
+
+class CameraSource(FrameSource):
+    """Persistent UVC MJPEG reader for a wrist camera.
+
+    The previous implementation launched and destroyed ffmpeg for every HTTP
+    frame.  That repeatedly negotiated an isochronous endpoint and made the
+    SDK tactile streams pause/resume (often permanently).  One long-lived
+    reader keeps the endpoint stable and lets all HTTP clients fan out from a
+    single latest-frame cache.  If the USB controller rejects the endpoint,
+    the reader backs off and retries without disturbing the tactile readers.
+    """
+
+    def __init__(self, spec: CameraSpec, ffmpeg: str, open_lock: threading.Lock):
+        super().__init__(spec)
+        self.ffmpeg = ffmpeg
+        self.open_lock = open_lock
+        self.process: subprocess.Popen[bytes] | None = None
+        self.thread: threading.Thread | None = None
+        self.process_lock = threading.RLock()
+        self._buffer = bytearray()
+        self._last_success = 0.0
+        self._retry_backoff_s = 0.0
+
+    def start(self) -> None:
+        if self.thread is not None and self.thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(
+            target=self._reader_loop,
+            name=f"uvc-{self.spec.name}",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def _command(self) -> list[str]:
+        return [
+            self.ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-f",
+            "v4l2",
+            "-input_format",
+            "mjpeg",
+            "-video_size",
+            "640x480",
+            "-framerate",
+            "30",
+            "-i",
+            self.spec.device,
+            "-an",
+            "-c:v",
+            "copy",
+            "-f",
+            "mjpeg",
+            "pipe:1",
+        ]
+
+    def _publish_buffered_frames(self) -> int:
+        published = 0
+        while True:
+            start = self._buffer.find(b"\xff\xd8")
+            if start < 0:
+                # Keep a possible SOI prefix split across read chunks.
+                if self._buffer and self._buffer[-1] == 0xFF:
+                    self._buffer[:] = b"\xff"
+                else:
+                    self._buffer.clear()
+                break
+            if start:
+                del self._buffer[:start]
+            end = self._buffer.find(b"\xff\xd9", 2)
+            if end < 0:
+                # A corrupt/stalled stream must not grow without bound.
+                if len(self._buffer) > 4 * 1024 * 1024:
+                    del self._buffer[:-2]
+                break
+            frame = bytes(self._buffer[: end + 2])
+            del self._buffer[: end + 2]
+            self._publish(frame)
+            self._last_success = time.monotonic()
+            self._retry_backoff_s = 0.0
+            published += 1
+        return published
+
+    def _terminate_process(self) -> None:
+        with self.process_lock:
+            proc = self.process
+            if proc is None:
+                return
+            if proc.poll() is None:
+                with contextlib.suppress(Exception):
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(Exception):
+                        proc.kill()
+                    with contextlib.suppress(Exception):
+                        proc.wait(timeout=1.0)
+            self.process = None
+
+    def _reader_loop(self) -> None:
+        backoff = 0.5
+        while not self.stop_event.is_set():
+            if not os.path.exists(self.spec.device):
+                self.last_error = f"device not found: {self.spec.device}"
+                self.stop_event.wait(min(30.0, backoff))
+                backoff = min(30.0, backoff * 2.0)
+                continue
+
+            proc: subprocess.Popen[bytes] | None = None
+            open_lock_held = False
+            self._buffer.clear()
+            try:
+                # Serialize UVC endpoint negotiation with SDK opens.  The
+                # kernel's USB2 bandwidth allocator is order-dependent when
+                # several cameras call STREAMON at the same time.
+                open_lock_held = self.open_lock.acquire(timeout=5.0)
+                if not open_lock_held:
+                    self.last_error = "camera open bus is busy"
+                    self.stop_event.wait(0.1)
+                    continue
+                proc = subprocess.Popen(
+                    self._command(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=0,
+                )
+                with self.process_lock:
+                    self.process = proc
+                if proc.stdout is None:
+                    raise RuntimeError("ffmpeg stdout is unavailable")
+                startup_deadline = time.monotonic() + 5.0
+                while not self.stop_event.is_set():
+                    chunk = proc.stdout.read(64 * 1024)
+                    if not chunk:
+                        break
+                    self._buffer.extend(chunk)
+                    published = self._publish_buffered_frames()
+                    if open_lock_held and published:
+                        self.open_lock.release()
+                        open_lock_held = False
+                    if open_lock_held and time.monotonic() >= startup_deadline:
+                        self.last_error = "UVC stream produced no frame during startup"
+                        break
+                return_code = proc.poll()
+                if return_code is None:
+                    return_code = proc.wait(timeout=1.0)
+                if self._last_success:
+                    backoff = 0.5
+                if return_code != 0 or self.latest() is None:
+                    self.last_error = (
+                        f"{USB_BANDWIDTH_ERROR} (ffmpeg exit={return_code})"
+                    )
+                elif not self.stop_event.is_set():
+                    self.last_error = f"ffmpeg stream stopped (exit={return_code})"
+            except Exception as exc:
+                self.last_error = f"UVC reader failed: {type(exc).__name__}: {exc}"
+                LOG.warning("camera %s: %s", self.spec.name, self.last_error)
+            finally:
+                if open_lock_held:
+                    with contextlib.suppress(Exception):
+                        self.open_lock.release()
+                self._terminate_process()
+
+            if not self.stop_event.is_set():
+                self._retry_backoff_s = min(30.0, backoff)
+                self.stop_event.wait(min(30.0, backoff))
+                backoff = min(30.0, backoff * 2.0)
+
+    def status(self) -> dict[str, Any]:
+        result = self._base_status()
+        result.update(
+            {
+                "stream_fps_max": 30,
+                "capture_mode": "persistent ffmpeg UVC MJPEG; latest-frame fanout",
+                "process_running": bool(
+                    self.process is not None and self.process.poll() is None
+                ),
+                "target_fps": CAMERA_STREAM_FPS,
+                "retry_backoff_s": self._retry_backoff_s,
+                "bandwidth_note": USB_BANDWIDTH_ERROR,
+            }
+        )
+        return result
+
+    def close(self) -> None:
+        self.stop_event.set()
+        with self.condition:
+            self.condition.notify_all()
+        self._terminate_process()
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=3.0)
+        self.thread = None
+
+
+class SdkTactileSource(FrameSource):
+    """One isolated xensesdk process per calibrated tactile camera.
+
+    xensesdk and OpenCV are intentionally kept out of the bridge's Python
+    process.  Each source launches ``tactile_worker.py`` and receives
+    length-prefixed JPEGs through a private pipe.  This isolates SDK state,
+    the GIL, allocator failures, and OpenCV thread pools between all four
+    sensors.  The parent still exposes the same latest-frame HTTP contract.
+
+    ``raw_size=(640, 480)`` is fixed in the worker.  Rectify output remains
+    ``rectify_size=(400, 700)`` (normally an array of shape ``(700, 400, 3)``).
+    The SDK's UVC backend negotiates MJPG at 120 Hz internally; this experiment
+    publishes/encodes each worker at a 120 Hz cadence.  The input remains the
+    original 640x480 frame and the HTTP stream still carries calibrated Rectify
+    output.
+    """
+
+    _MAX_FRAME_BYTES = 8 * 1024 * 1024
+
+    def __init__(self, spec: CameraSpec, open_lock: threading.Lock | None = None):
+        super().__init__(spec)
+        # Retain the lock argument for compatibility with the old source and
+        # CameraSource constructor.  Worker startup is serialized by
+        # BridgeState's start-and-wait sequence, while each worker owns its
+        # actual UVC negotiation in a separate process.
+        self.open_lock = open_lock
+        self.worker_path = Path(__file__).with_name("tactile_worker.py")
+        self.process: subprocess.Popen[bytes] | None = None
+        self.process_lock = threading.RLock()
+        self.pipe_fd: int | None = None
+        self.thread: threading.Thread | None = None
+        self.first_frame = threading.Event()
+        self._retry_backoff_s = 0.0
+
+    def start(self) -> None:
+        if self.thread is not None and self.thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(
+            target=self._reader_loop,
+            name=f"sdk-proc-{self.spec.name}",
+            daemon=True,
+        )
+        self.thread.start()
+
+    @staticmethod
+    def _read_exact(fd: int, size: int, stop_event: threading.Event) -> bytes | None:
+        data = bytearray()
+        while len(data) < size and not stop_event.is_set():
+            try:
+                ready, _, _ = select.select([fd], [], [], 0.5)
+            except (OSError, ValueError):
+                return None
+            if not ready:
+                continue
+            try:
+                chunk = os.read(fd, size - len(data))
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            data.extend(chunk)
+        return bytes(data) if len(data) == size else None
+
+    def _spawn_worker(self) -> bool:
+        if self.stop_event.is_set():
+            return False
+        if not self.worker_path.exists():
+            self.last_error = f"tactile worker not found: {self.worker_path}"
+            return False
+        with self.process_lock:
+            if self.process is not None and self.process.poll() is None:
+                return True
+            read_fd, write_fd = os.pipe()
+            try:
+                os.set_inheritable(write_fd, True)
+                command = [
+                    sys.executable,
+                    str(self.worker_path),
+                    "--serial",
+                    self.spec.sdk_serial or self.spec.device,
+                    "--fd",
+                    str(write_fd),
+                    "--fps",
+                    str(SDK_TACTILE_FPS),
+                    "--jpeg-quality",
+                    str(CAMERA_JPEG_QUALITY),
+                ]
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                    pass_fds=(write_fd,),
+                )
+            except Exception as exc:
+                with contextlib.suppress(OSError):
+                    os.close(read_fd)
+                with contextlib.suppress(OSError):
+                    os.close(write_fd)
+                self.last_error = f"tactile worker start failed: {type(exc).__name__}: {exc}"
+                return False
+            with contextlib.suppress(OSError):
+                os.close(write_fd)
+            self.pipe_fd = read_fd
+            self.process = process
+            self.first_frame.clear()
+            self.last_error = None
+            LOG.info(
+                "tactile %s worker started (pid=%s, raw_size=(640, 480), "
+                "rectify_size=(%d, %d), target=%g Hz)",
+                self.spec.name,
+                process.pid,
+                TACTILE_RECTIFY_WIDTH,
+                TACTILE_RECTIFY_HEIGHT,
+                SDK_TACTILE_FPS,
+            )
+            return True
+
+    def _terminate_worker(self) -> None:
+        with self.process_lock:
+            fd = self.pipe_fd
+            self.pipe_fd = None
+            process = self.process
+            self.process = None
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            if process is None:
+                return
+            if process.poll() is None:
+                with contextlib.suppress(Exception):
+                    process.terminate()
+                try:
+                    process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(Exception):
+                        process.kill()
+                    with contextlib.suppress(Exception):
+                        process.wait(timeout=1.0)
+
+    def wait_until_open(self, timeout: float = 5.0) -> bool:
+        """Wait until the worker has negotiated the sensor and sent a frame."""
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            if self.first_frame.is_set():
+                return True
+            process = self.process
+            if process is not None and process.poll() is not None:
+                return False
+            time.sleep(0.02)
+        return self.first_frame.is_set()
+
+    def _reader_loop(self) -> None:
+        backoff = 0.5
+        while not self.stop_event.is_set():
+            if not self._spawn_worker():
+                self._retry_backoff_s = backoff
+                self.stop_event.wait(min(30.0, backoff))
+                backoff = min(30.0, backoff * 2.0)
+                continue
+            fd = self.pipe_fd
+            if fd is None:
+                continue
+            clean_exit = False
+            try:
+                while not self.stop_event.is_set():
+                    header = self._read_exact(fd, 4, self.stop_event)
+                    if header is None:
+                        clean_exit = self.stop_event.is_set()
+                        break
+                    frame_len = struct.unpack("!I", header)[0]
+                    if frame_len <= 0 or frame_len > self._MAX_FRAME_BYTES:
+                        self.last_error = f"invalid tactile worker frame length: {frame_len}"
+                        break
+                    frame = self._read_exact(fd, frame_len, self.stop_event)
+                    if frame is None:
+                        clean_exit = self.stop_event.is_set()
+                        break
+                    self._publish(frame)
+                    self.first_frame.set()
+                    backoff = 0.5
+                    self._retry_backoff_s = 0.0
+            except Exception as exc:
+                self.last_error = f"tactile worker pipe failed: {type(exc).__name__}: {exc}"
+            finally:
+                self._terminate_worker()
+
+            if not self.stop_event.is_set():
+                if not clean_exit:
+                    self.last_error = self.last_error or "tactile worker stopped"
+                self._retry_backoff_s = backoff
+                self.stop_event.wait(min(30.0, backoff))
+                backoff = min(30.0, backoff * 2.0)
+
+    def status(self) -> dict[str, Any]:
+        result = self._base_status()
+        with self.process_lock:
+            process = self.process
+            pid = process.pid if process is not None else None
+            running = bool(process is not None and process.poll() is None)
+        result.update(
+            {
+                "sdk_serial": self.spec.sdk_serial,
+                "capture_mode": (
+                    "one isolated xensesdk worker process per tactile camera; "
+                    "raw_size=(640, 480); Rectify (400, 700); "
+                    "latest-frame pipe fanout"
+                ),
+                "sdk_output_type": "Rectify",
+                "sdk_rectify_size": [TACTILE_RECTIFY_WIDTH, TACTILE_RECTIFY_HEIGHT],
+                "sdk_raw_size": [640, 480],
+                "expected_sdk_array_shapes": [
+                    [TACTILE_RECTIFY_HEIGHT, TACTILE_RECTIFY_WIDTH, 3],
+                    [TACTILE_RECTIFY_WIDTH, TACTILE_RECTIFY_HEIGHT, 3],
+                ],
+                "stream_fps_max": TACTILE_STREAM_FPS,
+                "suspended": False,
+                "sdk_open": running and self.first_frame.is_set(),
+                "worker_process_running": running,
+                "worker_pid": pid,
+                "worker_retry_backoff_s": self._retry_backoff_s,
+            }
+        )
+        return result
+
+    def close(self) -> None:
+        self.stop_event.set()
+        with self.condition:
+            self.condition.notify_all()
+        self._terminate_worker()
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=3.0)
+        self.thread = None
+
+
+class BridgeState:
+    def __init__(
+        self,
+        ffmpeg: str,
+        gripper_specs: dict[str, GripperSpec],
+        camera_specs: dict[str, CameraSpec],
+        taccap_module: Any | None,
+    ):
+        """Own the hardware workers for one discovered device snapshot.
+
+        Discovery is deliberately performed before this constructor.  That
+        keeps the object graph deterministic and makes a replug recoverable by
+        restarting the service (the startup scripts do not retain stale paths).
+        """
+
+        try:
+            from xensesdk import Sensor
+        except Exception as exc:
+            Sensor = None
+            LOG.warning("xensesdk unavailable; tactile endpoints will use UVC fallback: %s", exc)
+
+        self.started_at = time.time()
+        self.stop_event = threading.Event()
+        self.camera_open_lock = threading.Lock()
+        # OpenCV's default worker pool can create one pool per SDK reader and
+        # starve the HTTP threads.  The SDK readers already run concurrently;
+        # one encoder thread per source is sufficient and has lower jitter.
+        with contextlib.suppress(Exception):
+            import cv2
+
+            cv2.setNumThreads(1)
+        self.tactile_mode = (
+            "xensesdk Sensor.OutputType.Rectify "
+            "(rectify_size=(400, 700), one worker process per source, 120 Hz target)"
+            if Sensor is not None
+            else "raw UVC MJPEG fallback (xensesdk unavailable; bandwidth-limited)"
+        )
+        self.grippers = {
+            side: GripperController(spec, taccap_module)
+            for side, spec in gripper_specs.items()
+        }
+        self.cameras: dict[str, Any] = {}
+        for name, spec in camera_specs.items():
+            if spec.kind == "tactile_raw" and Sensor is not None:
+                camera = SdkTactileSource(spec, self.camera_open_lock)
+            else:
+                camera = CameraSource(spec, ffmpeg, self.camera_open_lock)
+            self.cameras[name] = camera
+
+        # Give the isolated SDK tactile workers first chance to reserve their
+        # UVC endpoints.  Starting one source and waiting for its first frame
+        # keeps STREAMON ordering deterministic on the shared USB2 controller;
+        # the SDK object itself remains isolated in its child process.
+        for name, camera in self.cameras.items():
+            if name.endswith("_tactile_left") or name.endswith("_tactile_right"):
+                camera.start()
+                if isinstance(camera, SdkTactileSource):
+                    # Let endpoint negotiation settle before opening the next
+                    # sensor; simultaneous STREAMON calls are order-sensitive
+                    # on the shared USB2 controller.
+                    camera.wait_until_open(timeout=4.0)
+        for name, camera in self.cameras.items():
+            if name.endswith("_wrist"):
+                camera.start()
+        self.watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            name="motor-watchdog",
+            daemon=True,
+        )
+        self.watchdog_thread.start()
+
+    def _watchdog_loop(self) -> None:
+        while not self.stop_event.wait(0.25):
+            now = time.monotonic()
+            for controller in self.grippers.values():
+                controller.watchdog(now)
+
+    def close(self) -> None:
+        self.stop_event.set()
+        self.watchdog_thread.join(timeout=2.0)
+        for controller in self.grippers.values():
+            controller.close()
+        for camera in self.cameras.values():
+            camera.close()
+
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TacCap 远程控制</title>
+<style>
+:root { color-scheme: dark; font-family: system-ui, sans-serif; }
+body { max-width: 1500px; margin: auto; padding: 18px; background:#10141b; color:#e8edf5; }
+h1 { margin: 0 0 8px; } .hint { color:#aeb9ca; margin-bottom:18px; }
+.controls,.cameras { display:grid; gap:14px; }
+.controls { grid-template-columns:repeat(auto-fit,minmax(330px,1fr)); margin-bottom:18px; }
+.cameras { grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); }
+.card { background:#19212d; border:1px solid #303b4b; border-radius:12px; padding:14px; }
+.camera img { display:block; width:100%; aspect-ratio:4/3; object-fit:contain; background:#05070a; border-radius:8px; }
+.row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:10px 0; }
+button { border:0; border-radius:7px; padding:9px 13px; cursor:pointer; font-weight:650; }
+.enable { background:#48bd79; } .disable { background:#8893a3; }
+.open { background:#55a9f3; } .close { background:#f06c64; }
+input[type=range] { flex:1; min-width:180px; }
+.status { white-space:pre-wrap; font:13px/1.45 ui-monospace,monospace; color:#c9d6e7; min-height:90px; }
+.ok { color:#68d391; } .bad { color:#fc8181; }
+</style>
+</head>
+<body>
+<h1>TacCap 远程控制</h1>
+<div class="hint">0 = 完全闭合，1 = 完全张开。电机使能后需要持续心跳；连接中断约 5 秒会自动断使能。四路触觉由 .4 上的四个独立采集进程持续读取，网页发布目标 120 Hz，腕部相机保持 30 Hz；网页只接收最新帧，不会因某一路浏览器卡住而拖慢其它路。触觉输入保持原始 640×480，使用 xensesdk Sensor.OutputType.Rectify（SDK 参数 rectify_size=(400, 700)，标定矫正）。</div>
+<section class="controls" id="controls"></section>
+<section class="cameras" id="cameras"></section>
+<script>
+const armed = {left:false, right:false};
+const labels = {left:'左夹爪', right:'右夹爪'};
+async function api(path, options={}) {
+  const response = await fetch(path, {headers:{'Content-Type':'application/json'}, ...options});
+  const data = await response.json().catch(()=>({error:response.statusText}));
+  if (!response.ok) throw new Error(data.error || JSON.stringify(data));
+  return data;
+}
+function controlCard(side) {
+  return `<article class="card"><h2>${labels[side]}</h2>
+    <div class="row">
+      <button class="enable" onclick="enableSide('${side}')">使能</button>
+      <button class="disable" onclick="disableSide('${side}')">断使能</button>
+      <button class="open" onclick="moveSide('${side}',1,false)">完全张开</button>
+      <button class="close" onclick="closeSide('${side}')">完全闭合</button>
+    </div>
+    <div class="row"><span>位置</span><input id="slider-${side}" type="range" min="0" max="1" step="0.01" value="1">
+      <output id="value-${side}">1.00</output><button onclick="sendSlider('${side}')">发送</button></div>
+    <div class="status" id="status-${side}">读取中…</div></article>`;
+}
+document.querySelector('#controls').innerHTML = controlCard('left') + controlCard('right');
+for (const side of ['left','right']) {
+  const slider=document.querySelector(`#slider-${side}`), out=document.querySelector(`#value-${side}`);
+  slider.addEventListener('input',()=>out.textContent=Number(slider.value).toFixed(2));
+}
+async function enableSide(side) { try { await api(`/api/grippers/${side}/enable`,{method:'POST',body:'{}'}); armed[side]=true; await refresh(); } catch(e){alert(e.message);} }
+async function disableSide(side) { try { await api(`/api/grippers/${side}/disable`,{method:'POST',body:'{}'}); armed[side]=false; await refresh(); } catch(e){alert(e.message);} }
+async function moveSide(side, position, confirm_close) { try { await api(`/api/grippers/${side}/position`,{method:'POST',body:JSON.stringify({position,confirm_close})}); await refresh(); } catch(e){alert(e.message);} }
+function closeSide(side) { if(confirm(`确认让${labels[side]}完全闭合？请确保夹爪内没有手指或易损物。`)) moveSide(side,0,true); }
+function sendSlider(side) { const p=Number(document.querySelector(`#slider-${side}`).value); if(p<=0.05 && !confirm(`位置 ${p.toFixed(2)} 接近完全闭合，确认继续？`)) return; moveSide(side,p,p<=0.05); }
+async function refresh() {
+  try {
+    const all=await api('/api/grippers');
+    for(const side of ['left','right']) {
+      const s=all.grippers[side];
+      armed[side]=Boolean(s.armed);
+      const cls=s.available?'ok':'bad';
+      document.querySelector(`#status-${side}`).innerHTML=`<span class="${cls}">${s.available?'在线':'不可用'}</span>\n`+
+        `位置: ${s.position===undefined?'--':s.position.toFixed(3)}  原始: ${s.raw_position_rad===undefined?'--':s.raw_position_rad.toFixed(4)} rad\n`+
+        `使能: ${s.enabled?'是':'否'}  服务已授权: ${s.armed?'是':'否'}  剩余: ${Number(s.lease_remaining_s||0).toFixed(1)} s\n`+
+        `速度: ${s.velocity_rad_s===undefined?'--':s.velocity_rad_s.toFixed(3)} rad/s  力矩: ${s.torque_nm===undefined?'--':s.torque_nm.toFixed(3)} Nm\n`+
+        `温度: ${s.motor_temp_c===undefined?'--':s.motor_temp_c.toFixed(1)} °C  状态: ${(s.status_flags||[]).join(', ')||'--'}\n`+
+        `${s.last_error||''}`;
+    }
+  } catch(e) { console.error(e); }
+}
+async function loadCameras() {
+  const data=await api('/api/cameras');
+  document.querySelector('#cameras').innerHTML=data.cameras.map(c=>`<article class="card camera"><h3>${c.label}</h3><img data-camera="${c.name}" data-stream-fps="${c.kind==='tactile_raw'?120:30}" src="${c.stream_url}" alt="${c.label}" decoding="async"><small id="camera-meta-${c.name}">${c.name} · 采集 ${c.source_fps===null?'--':c.source_fps} Hz</small></article>`).join('');
+  for (const img of document.querySelectorAll('img[data-camera]')) {
+    attachStreamRetry(img);
+  }
+}
+function attachStreamRetry(img) {
+  img.addEventListener('error',()=>setTimeout(()=>{
+    const base=img.dataset.camera;
+    const fps=img.dataset.streamFps||30;
+    img.src=`/camera/${base}.mjpg?fps=${fps}&retry=${Date.now()}`;
+    attachStreamRetry(img);
+  },2000),{once:true});
+}
+async function refreshCameras() {
+  try {
+    const data=await api('/api/cameras');
+    for (const c of data.cameras) {
+      const el=document.querySelector(`#camera-meta-${c.name}`);
+      if (el) el.textContent=`${c.name} · 采集 ${c.source_fps===null?'--':Number(c.source_fps).toFixed(1)} Hz · ${c.available?'在线':'不可用'} · 客户端 ${c.clients||0}`;
+    }
+  } catch(e) { console.error(e); }
+}
+setInterval(()=>{ for(const side of ['left','right']) if(armed[side]) api(`/api/grippers/${side}/heartbeat`,{method:'POST',body:'{}'}).catch(()=>armed[side]=false); },1000);
+setInterval(refresh,1000); setInterval(refreshCameras,1000); refresh(); loadCameras().then(refreshCameras).catch(e=>alert(e.message));
+</script>
+</body></html>"""
+
+
+def make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "TacCapBridge/1.0"
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            # The LeRobot remote follower polls each side at 30 Hz and sends a
+            # heartbeat roughly once per second.  Logging every status GET at
+            # INFO would grow the service log by several megabytes per minute;
+            # retain the entries at DEBUG while keeping snapshots, streams,
+            # control commands, and errors visible at INFO.
+            path = urllib.parse.urlsplit(self.path).path
+            high_rate_status = (
+                (self.command == "GET" and path.startswith("/api/grippers/"))
+                or (self.command == "POST" and path.endswith("/heartbeat"))
+            )
+            level = LOG.debug if high_rate_status else LOG.info
+            level("http %s - %s", self.address_string(), fmt % args)
+
+        def _send_bytes(
+            self,
+            status: int,
+            content: bytes,
+            content_type: str,
+            headers: dict[str, str] | None = None,
+        ) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            if headers:
+                for key, value in headers.items():
+                    self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(content)
+
+        def _json(self, status: int, value: Any) -> None:
+            content = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode()
+            self._send_bytes(status, content, "application/json; charset=utf-8")
+
+        def _read_json(self) -> dict[str, Any]:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as exc:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "invalid Content-Length") from exc
+            if length > 4096:
+                raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request body too large")
+            if not length:
+                return {}
+            try:
+                value = json.loads(self.rfile.read(length))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ApiError(HTTPStatus.BAD_REQUEST, f"invalid JSON: {exc}") from exc
+            if not isinstance(value, dict):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "JSON body must be an object")
+            return value
+
+        def do_GET(self) -> None:
+            try:
+                parsed = urllib.parse.urlparse(self.path)
+                path = parsed.path
+                if path == "/":
+                    self._send_bytes(
+                        HTTPStatus.OK,
+                        INDEX_HTML.encode(),
+                        "text/html; charset=utf-8",
+                    )
+                    return
+                if path == "/api/health":
+                    self._json(
+                        HTTPStatus.OK,
+                        {
+                            "ok": True,
+                            "uptime_s": round(time.time() - state.started_at, 3),
+                            "bind_policy": "loopback-only; use an SSH tunnel",
+                            "motor_lease_timeout_s": LEASE_TIMEOUT_S,
+                            "tactile_mode": state.tactile_mode,
+                            "camera_target_fps": CAMERA_STREAM_FPS,
+                            "tactile_target_fps": TACTILE_STREAM_FPS,
+                            "camera_transport": "persistent producers + latest-frame fanout",
+                        },
+                    )
+                    return
+                if path == "/api/grippers":
+                    self._json(
+                        HTTPStatus.OK,
+                        {"grippers": {k: v.status() for k, v in state.grippers.items()}},
+                    )
+                    return
+                if path.startswith("/api/grippers/"):
+                    side = path[len("/api/grippers/") :].strip("/")
+                    if side in state.grippers:
+                        self._json(HTTPStatus.OK, state.grippers[side].status())
+                        return
+                if path == "/api/cameras":
+                    cameras = [c.status() for c in state.cameras.values()]
+                    self._json(
+                        HTTPStatus.OK,
+                        {
+                            "cameras": cameras,
+                            "all_six_fresh_30hz": all(
+                                c.get("available")
+                                and isinstance(c.get("source_fps"), (int, float))
+                                and c["source_fps"] >= 27.0
+                                for c in cameras
+                            ),
+                            "all_four_tactile_fresh_120hz": all(
+                                c.get("available")
+                                and c.get("kind") == "tactile_raw"
+                                and isinstance(c.get("source_fps"), (int, float))
+                                and c["source_fps"] >= 108.0
+                                for c in cameras
+                                if c.get("kind") == "tactile_raw"
+                            ),
+                        },
+                    )
+                    return
+                if path.startswith("/camera/") and path.endswith(".jpg"):
+                    name = path[len("/camera/") : -len(".jpg")]
+                    self._snapshot(name)
+                    return
+                if path.startswith("/camera/") and path.endswith(".mjpg"):
+                    name = path[len("/camera/") : -len(".mjpg")]
+                    camera = self._camera(name)
+                    query = urllib.parse.parse_qs(parsed.query)
+                    max_fps = (
+                        TACTILE_STREAM_FPS
+                        if camera.spec.kind == "tactile_raw"
+                        else CAMERA_STREAM_FPS
+                    )
+                    try:
+                        fps = float(query.get("fps", [str(max_fps)])[0])
+                    except ValueError:
+                        fps = max_fps
+                    self._mjpeg(name, min(max_fps, max(0.2, fps)))
+                    return
+                raise ApiError(HTTPStatus.NOT_FOUND, "not found")
+            except ApiError as exc:
+                self._json(exc.status, {"error": str(exc)})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as exc:
+                LOG.exception("GET %s failed", self.path)
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+
+        def _camera(self, name: str) -> Any:
+            camera = state.cameras.get(name)
+            if camera is None:
+                raise ApiError(HTTPStatus.NOT_FOUND, f"unknown camera: {name}")
+            return camera
+
+        def _snapshot(self, name: str) -> None:
+            camera = self._camera(name)
+            item = camera.wait_for_frame(timeout=10.0)
+            if item is None:
+                raise ApiError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    camera.last_error or f"no frame from {name}",
+                )
+            _, frame = item
+            self._send_bytes(
+                HTTPStatus.OK,
+                frame,
+                "image/jpeg",
+                {"X-Camera-Name": name},
+            )
+
+        def _mjpeg(self, name: str, fps: float) -> None:
+            camera = self._camera(name)
+            # Acquisition is performed by one producer thread per camera.  Do
+            # not start a capture here: every browser/client must fan out from
+            # the same cache, otherwise a slow HTTP socket can stall USB.
+            first = camera.wait_for_frame(timeout=12.0)
+            if first is None:
+                raise ApiError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    camera.last_error or f"no frame from {name}",
+                )
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.close_connection = True
+            # A dead/slow browser must not leave a handler blocked forever.
+            # The producer is independent, so timing out this socket only
+            # disconnects this client and never affects another stream.
+            with contextlib.suppress(Exception):
+                self.connection.settimeout(2.0)
+            camera.register_client()
+            sequence, frame = first
+            interval = 1.0 / fps
+            next_send = time.monotonic()
+            try:
+                while not state.stop_event.is_set() and not camera.stop_event.is_set():
+                    header = (
+                        b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                        + str(len(frame)).encode()
+                        + b"\r\nX-Source-Sequence: "
+                        + str(sequence).encode()
+                        + b"\r\n\r\n"
+                    )
+                    self.wfile.write(header)
+                    self.wfile.write(frame)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+
+                    next_send += interval
+                    delay = next_send - time.monotonic()
+                    if delay > 0 and state.stop_event.wait(delay):
+                        break
+                    # Skip stale frames when the source is ahead, and repeat
+                    # the latest frame if a source momentarily misses a tick.
+                    item = camera.wait_for_frame(
+                        timeout=max(0.05, min(1.0, interval * 2.5)),
+                        after_sequence=sequence,
+                    )
+                    if item is not None:
+                        sequence, frame = item
+                    else:
+                        latest = camera.latest()
+                        if latest is not None:
+                            sequence, frame = latest
+            except (BrokenPipeError, ConnectionResetError, socket.timeout, TimeoutError):
+                pass
+            finally:
+                camera.unregister_client()
+
+        def do_POST(self) -> None:
+            try:
+                path = urllib.parse.urlparse(self.path).path
+                parts = [p for p in path.split("/") if p]
+                if len(parts) != 4 or parts[:2] != ["api", "grippers"]:
+                    raise ApiError(HTTPStatus.NOT_FOUND, "not found")
+                side, action = parts[2], parts[3]
+                controller = state.grippers.get(side)
+                if controller is None:
+                    raise ApiError(HTTPStatus.NOT_FOUND, f"unknown side: {side}")
+                body = self._read_json()
+                if action == "enable":
+                    result = controller.enable()
+                elif action == "disable":
+                    result = controller.disable()
+                elif action == "heartbeat":
+                    result = controller.heartbeat()
+                elif action == "position":
+                    if "position" not in body:
+                        raise ApiError(HTTPStatus.BAD_REQUEST, "missing position")
+                    try:
+                        position = float(body["position"])
+                    except (TypeError, ValueError) as exc:
+                        raise ApiError(HTTPStatus.BAD_REQUEST, "position must be numeric") from exc
+                    result = controller.set_position(
+                        position,
+                        confirm_close=body.get("confirm_close") is True,
+                    )
+                else:
+                    raise ApiError(HTTPStatus.NOT_FOUND, f"unknown action: {action}")
+                self._json(HTTPStatus.OK, result)
+            except ApiError as exc:
+                self._json(exc.status, {"error": str(exc)})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as exc:
+                LOG.exception("POST %s failed", self.path)
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+
+    return Handler
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--ffmpeg", default="/usr/bin/ffmpeg")
+    parser.add_argument("--log-level", default="INFO")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(threadName)s %(message)s",
+    )
+    if args.host not in {"127.0.0.1", "localhost", "::1"}:
+        raise SystemExit("refusing a non-loopback bind; use an SSH tunnel")
+    if not os.path.isfile(args.ffmpeg):
+        raise SystemExit(f"ffmpeg not found: {args.ffmpeg}")
+
+    try:
+        from xense import taccap
+    except Exception as exc:
+        # UVC wrist streams can still be diagnosed without the native motor
+        # package.  Gripper endpoints remain visible as unavailable until the
+        # SDK environment is repaired and the service is restarted.
+        taccap = None
+        LOG.exception("xense.taccap import failed; motor control is unavailable: %s", exc)
+
+    gripper_specs, camera_specs = discover_specs(taccap)
+    LOG.info(
+        "startup discovery: grippers=%s cameras=%s",
+        sorted(gripper_specs),
+        sorted(camera_specs),
+    )
+    state = BridgeState(args.ffmpeg, gripper_specs, camera_specs, taccap)
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(state))
+    server.daemon_threads = True
+
+    def shutdown(signum: int, _frame: Any) -> None:
+        LOG.info("received signal %s; shutting down", signum)
+        threading.Thread(target=server.shutdown, name="http-shutdown", daemon=True).start()
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+    LOG.info("listening on http://%s:%d", args.host, args.port)
+    try:
+        server.serve_forever(poll_interval=0.25)
+    finally:
+        server.server_close()
+        state.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
