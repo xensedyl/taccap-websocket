@@ -1,6 +1,10 @@
 # Runtime dependencies for a fresh target device.
-# Proprietary/native wheels may need a private index or local wheel path.
-numpy>=1.24
-opencv-python-headless>=4.8
-xensesdk
-taccap-gripper
+#
+# Keep the versions in sync with the offline wheel bundle.  xensesdk is the
+# vendor wheel that provides Sensor.OutputType.Rectify; taccap-gripper is built
+# from the official TacCap-Gripper repository:
+# https://github.com/XenseRobotics-AI/TacCap-Gripper
+numpy==2.2.4
+opencv-python==4.12.0.88
+xensesdk==2.1.3
+taccap-gripper==0.1.9

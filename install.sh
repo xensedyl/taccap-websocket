@@ -13,6 +13,7 @@ Options:
   --bootstrap-python      Install a private Python 3.12 with uv when needed
   --env-script PATH       SDK environment script sourced before startup
   --wheel-dir DIR         Directory containing private SDK wheels
+  --offline-dir DIR       Offline bundle containing python/ and wheels/
   --with-deps             Create .venv and install requirements.txt
   --install-system-deps   Install Ubuntu packages with apt (sudo required)
   --enable-systemd        Install and enable a user systemd service
@@ -29,6 +30,8 @@ if [[ -n "${TACCAP_BASE_PYTHON:-}" ]]; then
     python_explicit=1
 fi
 wheel_dir="${TACCAP_WHEEL_DIR:-}"
+offline_dir="${TACCAP_OFFLINE_DIR:-}"
+offline_mode=0
 bootstrap_python=0
 env_script=""
 env_script_explicit=0
@@ -63,6 +66,11 @@ while (($#)); do
         --wheel-dir)
             (($# >= 2)) || { echo "missing argument for --wheel-dir" >&2; exit 2; }
             wheel_dir="$2"
+            shift 2
+            ;;
+        --offline-dir)
+            (($# >= 2)) || { echo "missing argument for --offline-dir" >&2; exit 2; }
+            offline_dir="$2"
             shift 2
             ;;
         --with-deps)
@@ -105,6 +113,11 @@ case "$install_dir" in
 esac
 
 if ((install_system_deps)); then
+    if [[ -n "$offline_dir" ]]; then
+        echo "--install-system-deps cannot be used with --offline-dir" >&2
+        echo "Install the required Ubuntu packages before disconnecting the target." >&2
+        exit 2
+    fi
     command -v sudo >/dev/null 2>&1 || {
         echo "sudo is required for --install-system-deps" >&2
         exit 1
@@ -115,14 +128,69 @@ if ((install_system_deps)); then
         python3 python3-pip python3-venv rsync v4l-utils
 fi
 
-if ((bootstrap_python)); then
+if [[ -n "$offline_dir" ]]; then
+    if ((bootstrap_python)); then
+        echo "--bootstrap-python cannot be used with --offline-dir" >&2
+        exit 2
+    fi
+    if ((python_explicit)); then
+        echo "--python cannot be used with --offline-dir; the bundle supplies Python 3.12" >&2
+        exit 2
+    fi
+    if ((with_deps == 0)); then
+        echo "--no-deps cannot be used with --offline-dir; the bundle must populate .venv" >&2
+        exit 2
+    fi
+    if ((env_script_explicit)); then
+        echo "--env-script cannot be used with --offline-dir; configure target libraries in the image" >&2
+        exit 2
+    fi
+    [[ -d "$offline_dir/python" && -d "$offline_dir/wheels" ]] || {
+        echo "offline bundle must contain python/ and wheels/: $offline_dir" >&2
+        exit 1
+    }
+    [[ -f "$offline_dir/manifest.txt" ]] || {
+        echo "offline bundle is missing manifest.txt: $offline_dir" >&2
+        exit 1
+    }
+    offline_mode=1
+    # The target may not have the installation directory yet.  Create only
+    # the managed runtime parent before staging the copied interpreter.
+    mkdir -p "$install_dir/.runtime"
+    python_home="$install_dir/.runtime/python"
+    # The managed interpreter is copied rather than installed by uv on the
+    # target.  This is what makes a deployment work without internet access or
+    # a pre-existing Python 3.12 installation.
+    runtime_stage="$(mktemp -d "$install_dir/.runtime/.python.XXXXXX")"
+    tar -cf - -C "$offline_dir/python" . | tar -xf - -C "$runtime_stage"
+    if [[ -e "$python_home" ]]; then
+        # Only replace a runtime previously managed by this installer.  Do not
+        # remove an administrator-owned directory by accident.
+        if [[ ! -f "$install_dir/.runtime/.managed-by-taccap" ]]; then
+            echo "refusing to replace unmanaged runtime: $python_home" >&2
+            rm -rf -- "$runtime_stage"
+            exit 1
+        fi
+        rm -rf -- "$python_home"
+    fi
+    mv -- "$runtime_stage" "$python_home"
+    : >"$install_dir/.runtime/.managed-by-taccap"
+    base_python="$(find "$python_home" \( -type f -o -type l \) \
+        -path '*/bin/python3.12' -print -quit)"
+    [[ -x "$base_python" ]] || {
+        echo "offline bundle contains no executable Python 3.12 under $python_home" >&2
+        exit 1
+    }
+    wheel_dir="$offline_dir/wheels"
+elif ((bootstrap_python)); then
     command -v uv >/dev/null 2>&1 || {
         echo "uv is required for --bootstrap-python; install it from https://astral.sh/uv" >&2
         exit 1
     }
     python_home="$install_dir/.runtime/python"
     uv python install 3.12 --install-dir "$python_home"
-    base_python="$(find "$python_home" -type f -path '*/bin/python' -print -quit)"
+    base_python="$(find "$python_home" \( -type f -o -type l \) \
+        -path '*/bin/python3.12' -print -quit)"
     [[ -x "$base_python" ]] || {
         echo "uv installed Python but no executable was found under $python_home" >&2
         exit 1
@@ -156,6 +224,9 @@ if [[ "$script_dir" != "$install_dir" ]]; then
     tar \
         --exclude='./.git' \
         --exclude='./.venv' \
+        --exclude='./.runtime' \
+        --exclude='./offline' \
+        --exclude='./vendor' \
         --exclude='./config/taccap.env' \
         --exclude='./config/devices.json' \
         --exclude='./taccap.pid' \
@@ -222,16 +293,30 @@ fi
 
 if ((with_deps)); then
     "$base_python" -m venv "$install_dir/.venv"
-    "$install_dir/.venv/bin/python" -m pip install --upgrade pip
     if [[ -n "$wheel_dir" ]]; then
         [[ -d "$wheel_dir" ]] || {
             echo "wheel directory not found: $wheel_dir" >&2
             exit 1
         }
-        "$install_dir/.venv/bin/python" -m pip install \
-            --no-deps --no-index --find-links "$wheel_dir" xensesdk taccap-gripper
+        shopt -s nullglob
+        private_wheels=(
+            "$wheel_dir"/xensesdk-*.whl
+            "$wheel_dir"/taccap_gripper-*.whl
+        )
+        shopt -u nullglob
+        ((${#private_wheels[@]} >= 2)) || {
+            echo "wheel directory must contain xensesdk and taccap-gripper wheels: $wheel_dir" >&2
+            exit 1
+        }
     fi
-    if [[ -n "$wheel_dir" ]]; then
+    if ((offline_mode)); then
+        # Never let pip consult an index in offline mode.  This is deliberately
+        # one resolver invocation so transitive dependencies (including the
+        # vendor-only cypack 0.1.2 wheel) are checked together.
+        "$install_dir/.venv/bin/python" -m pip install \
+            --no-index --find-links "$wheel_dir" \
+            -r "$install_dir/requirements.txt"
+    elif [[ -n "$wheel_dir" ]]; then
         "$install_dir/.venv/bin/python" -m pip install \
             --find-links "$wheel_dir" -r "$install_dir/requirements.txt"
     else

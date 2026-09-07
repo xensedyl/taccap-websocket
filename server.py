@@ -438,6 +438,49 @@ class GripperController:
         self.config = None
         self.armed = False
 
+    @staticmethod
+    def _is_serial_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return (
+            "serialbus" in text
+            or "input/output error" in text
+            or "broken pipe" in text
+            or "device disappeared" in text
+        )
+
+    def _invalidate_transport_locked(self, reason: Exception) -> None:
+        """Drop a stale USB handle so the next operation can reconnect.
+
+        A USB serial adapter can be re-enumerated while the process remains
+        alive.  The SDK object then keeps the old file descriptor: status
+        reads may continue to show its last cached sample, while the first
+        command fails with ``SerialBus::write: Input/output error``.  Closing
+        that object and reconnecting by-id is safe because the watchdog state
+        is cleared before a new motor object is exposed.
+        """
+        self.last_error = f"{type(reason).__name__}: {reason}"
+        self.armed = False
+        self.last_lease = 0.0
+        old_gripper = self.gripper
+        self.gripper = None
+        self.config = None
+        self.last_connect_attempt = time.monotonic()
+        if old_gripper is not None:
+            try:
+                old_gripper.transport.stop()
+            except Exception:
+                LOG.debug("%s stale transport stop failed", self.spec.side, exc_info=True)
+
+    def _reconnect_after_serial_error_locked(self, reason: Exception) -> bool:
+        self._invalidate_transport_locked(reason)
+        # The status loop may reconnect in the background.  A control request
+        # should also recover immediately when the cable has already settled.
+        self.last_connect_attempt = 0.0
+        connected = self._connect_locked()
+        if connected:
+            self._start_status_reader()
+        return connected
+
     def _connect_locked(self) -> bool:
         self.last_connect_attempt = time.monotonic()
         self._stop_transport_locked()
@@ -509,64 +552,77 @@ class GripperController:
         period = 1.0 / 100.0
         next_read = time.monotonic()
         while not self.status_stop.is_set():
+            value: dict[str, Any] | None = None
             try:
                 with self.lock:
                     gripper = self.gripper
                     if gripper is None:
-                        break
-                    sample = gripper.motor.read_status(500)
-                    raw_status = int(sample.status)
-                    hardware_enabled = bool(raw_status & 0x0001)
-                    if self.armed and not hardware_enabled:
-                        self.armed = False
-                        self.last_lease = 0.0
-                    normalized = min(1.0, max(0.0, float(gripper.rad_to_pos(float(sample.actual_pos)))))
-                    cfg = self.config
-                    remaining = (
-                        max(0.0, LEASE_TIMEOUT_S - (time.monotonic() - self.last_lease))
-                        if self.armed
-                        else 0.0
-                    )
-                    value = {
-                        "side": self.spec.side,
-                        "available": True,
-                        "serial_number": self.spec.serial_number,
-                        "firmware_serial": self.spec.firmware_serial,
-                        "mcu_device": self.spec.mcu_device,
-                        "armed": self.armed,
-                        "enabled": hardware_enabled,
-                        "lease_remaining_s": round(remaining, 3),
-                        "position": normalized,
-                        "raw_position_rad": float(sample.actual_pos),
-                        "velocity_rad_s": float(sample.actual_vel),
-                        "torque_nm": float(sample.actual_torque),
-                        "motor_temp_c": float(sample.motor_temp_c),
-                        "status": raw_status,
-                        "status_flags": [
-                            name for bit, name in MOTOR_STATUS_BITS.items() if raw_status & bit
-                        ],
-                        "target_position": self.target_position,
-                        "firmware_target_rad": float(sample.target_pos),
-                        "control_mode": int(sample.control_mode),
-                        "config": {
-                            "flags": int(cfg.flags),
-                            "max_open_rad": float(cfg.max_open_rad),
-                            "min_open_rad": float(cfg.min_open_rad),
-                            "reverse": bool(int(cfg.flags) & 0x0002),
-                        },
-                        "limits": {
-                            "max_velocity_rad_s": MAX_VELOCITY_RAD_S,
-                            "max_torque_nm": MAX_TORQUE_NM,
-                        },
-                        "last_error": None,
-                    }
-                    self.last_error = None
-                with self.status_condition:
-                    self.latest_status = value
-                    self.status_sequence += 1
-                    self.status_condition.notify_all()
+                        if time.monotonic() - self.last_connect_attempt >= 2.0:
+                            self._connect_locked()
+                        gripper = self.gripper
+                    if gripper is None:
+                        # Keep the producer alive while a re-enumerated USB
+                        # adapter settles; status() will report the last error.
+                        pass
+                    else:
+                        sample = gripper.motor.read_status(500)
+                        raw_status = int(sample.status)
+                        hardware_enabled = bool(raw_status & 0x0001)
+                        if self.armed and not hardware_enabled:
+                            self.armed = False
+                            self.last_lease = 0.0
+                        normalized = min(1.0, max(0.0, float(gripper.rad_to_pos(float(sample.actual_pos)))))
+                        cfg = self.config
+                        remaining = (
+                            max(0.0, LEASE_TIMEOUT_S - (time.monotonic() - self.last_lease))
+                            if self.armed
+                            else 0.0
+                        )
+                        value = {
+                            "side": self.spec.side,
+                            "available": True,
+                            "serial_number": self.spec.serial_number,
+                            "firmware_serial": self.spec.firmware_serial,
+                            "mcu_device": self.spec.mcu_device,
+                            "armed": self.armed,
+                            "enabled": hardware_enabled,
+                            "lease_remaining_s": round(remaining, 3),
+                            "position": normalized,
+                            "raw_position_rad": float(sample.actual_pos),
+                            "velocity_rad_s": float(sample.actual_vel),
+                            "torque_nm": float(sample.actual_torque),
+                            "motor_temp_c": float(sample.motor_temp_c),
+                            "status": raw_status,
+                            "status_flags": [
+                                name for bit, name in MOTOR_STATUS_BITS.items() if raw_status & bit
+                            ],
+                            "target_position": self.target_position,
+                            "firmware_target_rad": float(sample.target_pos),
+                            "control_mode": int(sample.control_mode),
+                            "config": {
+                                "flags": int(cfg.flags),
+                                "max_open_rad": float(cfg.max_open_rad),
+                                "min_open_rad": float(cfg.min_open_rad),
+                                "reverse": bool(int(cfg.flags) & 0x0002),
+                            },
+                            "limits": {
+                                "max_velocity_rad_s": MAX_VELOCITY_RAD_S,
+                                "max_torque_nm": MAX_TORQUE_NM,
+                            },
+                            "last_error": None,
+                        }
+                        self.last_error = None
+                if value is not None:
+                    with self.status_condition:
+                        self.latest_status = value
+                        self.status_sequence += 1
+                        self.status_condition.notify_all()
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"
+                if self._is_serial_error(exc):
+                    with self.lock:
+                        if self.gripper is not None:
+                            self._invalidate_transport_locked(exc)
                 if not self.status_stop.wait(0.05):
                     LOG.debug("%s status read failed: %s", self.spec.side, self.last_error)
             next_read += period
@@ -603,6 +659,16 @@ class GripperController:
                 self.last_lease = time.monotonic()
                 self.last_error = None
             except Exception as exc:
+                if self._is_serial_error(exc) and self._reconnect_after_serial_error_locked(exc):
+                    try:
+                        self.gripper.motor.clear_fault()
+                        self.gripper.motor.enable()
+                        self.armed = True
+                        self.last_lease = time.monotonic()
+                        self.last_error = None
+                        return self.status()
+                    except Exception as retry_exc:
+                        exc = retry_exc
                 self.armed = False
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 raise ApiError(HTTPStatus.CONFLICT, self.last_error) from exc

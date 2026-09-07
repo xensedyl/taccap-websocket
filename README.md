@@ -14,131 +14,81 @@ rectify_size=(400, 700)（宽、高）。SDK 返回通常为 (700, 400, 3)，LeR
 客户端再转换为旧数据集使用的 (400, 700, 3)。设备编号优先使用 TacCap 固件
 序列号、V4L2 by-id 和 USB 拓扑发现，不依赖会随重启变化的 /dev/videoN。
 
-## 迁移方式
+## 迁移和离线部署
 
-本机 Git 仓库是唯一源代码来源，目标设备只保存部署后的运行副本。换设备时，不需要
-复制旧设备的 Python 虚拟环境或手工修改串口路径；把仓库部署到新设备即可。
+本机 Git 仓库是源代码来源，目标设备只保存运行副本。`.4` 不能联网时，不能在目标机
+执行 `uv`、`pip install`、`--bootstrap-python` 或 `--install-system-deps`；这些动作会
+尝试访问网络。正确做法是在有网络的本机生成一次离线 bundle，再通过 SSH 上传。
 
-### 方式一：本机通过 SSH 一键部署
+### 1. 生成离线 bundle（本机执行）
 
-在本仓库目录执行：
+仓库已经包含按 `.4`（Ubuntu 20.04 x86_64、OpenCV 4.2）构建的 TacCap-Gripper
+0.1.9 wheel，以及 xensesdk wheel。执行：
 
 ~~~bash
 cd /home/xense/tron2/taccap-websocket
-./deploy.sh guest@10.192.1.4 \
-  --python /home/guest/py312/bin/python \
-  --env-script /home/guest/activate_taccap312 \
-  --no-deps
+./bundle_offline.sh \
+  --xensesdk-wheel vendor/wheels/xensesdk-2.1.3-cp312-cp312-manylinux_2_31_x86_64.whl \
+  --taccap-wheel vendor/wheels/taccap_gripper-0.1.9-cp312-cp312-linux_x86_64.whl
 ~~~
 
-换成新设备时只替换 SSH 地址：
+脚本会在本机下载一个可复制的 Python 3.12、所有公开依赖和 `cypack 0.1.2`，生成
+被 Git 忽略的 `offline/` 目录（约 270 MB）。目标机不需要 Python、pip、uv 或网络。
+`offline/manifest.txt` 记录 bundle 的提交和每个 wheel 的 SHA256。
 
-~~~bash
-./deploy.sh user@NEW_DEVICE_IP --install-system-deps --enable-systemd
-~~~
+如果只从 Git 克隆而没有 `offline/`，先在能联网的开发机运行上面的命令；离线 bundle
+是平台相关的发布物，不建议把整套 Python 运行时提交进 Git。
 
-新设备没有 Python 3.12、`TACCAP_PYTHON` 或旧设备激活脚本时，使用自动引导模式：
-
-~~~bash
-./deploy.sh user@NEW_DEVICE_IP \
-  --bootstrap-python \
-  --install-system-deps \
-  --enable-systemd
-~~~
-
-该模式需要目标设备能访问网络，并预先安装 `uv`。它会将 Python 3.12 放在项目的
-`.runtime/python` 下。若目标设备没有 `uv`，可先执行官方安装命令：
-
-~~~bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-~~~
-
-若环境不能联网，则应准备 Python 3.12 或使用 `--wheel-dir` 上传专有 SDK wheel。
-
-deploy.sh 会完成以下工作：
-
-1. 以当前 Git 提交为版本打包（不会上传 .git、日志、PID、虚拟环境或本地配置）；
-2. 通过 SSH 上传到目标设备的临时目录；
-3. 在目标设备运行 install.sh；
-4. 默认创建项目专用 .venv 并安装 requirements.txt；
-5. 可选安装 Ubuntu 的 Python、FFmpeg、V4L2 工具；
-6. 保留目标设备已有的 config/taccap.env；
-7. 可选安装并启动用户级 systemd 服务。
-
-部署脚本使用同一个 SSH 复用连接，因此密码登录通常只输入一次。长期使用建议先运行
-`ssh-copy-id user@NEW_DEVICE_IP` 配置 SSH 密钥。
-
-默认安装目录是目标用户的 ~/taccap-websocket。如果需要固定到其他目录：
+### 2. SSH 一键部署到新设备
 
 ~~~bash
 ./deploy.sh user@NEW_DEVICE_IP \
-  --install-dir /home/user/taccap-websocket \
-  --install-system-deps \
+  --offline-dir /home/xense/tron2/taccap-websocket/offline \
   --enable-systemd
 ~~~
 
-如果目标设备已经准备好所有 Python 依赖，可以跳过虚拟环境安装：
-
-~~~bash
-./deploy.sh user@NEW_DEVICE_IP --no-deps --enable-systemd
-~~~
-
-如果专有 SDK wheel 不在 Python 包索引中，可以从本机一起上传 wheel 目录：
+部署脚本会上传源码和 bundle，在目标机的 `.runtime/python` 中安装自带 Python，使用
+`pip --no-index` 从本地 wheel 目录创建 `.venv`，然后启动服务。目标机不需要旧设备的
+`/home/guest/py312/bin/python` 或 `activate_taccap312`。如果先验证而不启动：
 
 ~~~bash
 ./deploy.sh user@NEW_DEVICE_IP \
-  --wheel-dir /home/xense/sdk-wheels \
-  --install-system-deps \
-  --enable-systemd
+  --offline-dir /home/xense/tron2/taccap-websocket/offline \
+  --no-start
 ~~~
 
-wheel 目录至少应包含 xensesdk 和 taccap-gripper 的兼容 wheel；其余公开依赖仍从
-`requirements.txt` 安装。
+目标设备需要预先具备系统运行库和设备访问权限：`/usr/bin/ffmpeg`、`curl`、USB/UVC
+驱动，以及与 `.4` 相同的 Ubuntu 20.04 OpenCV 4.2 ABI。离线安装器不会调用 apt；若
+这些系统组件缺失，应在设备联网时安装，或由设备镜像/离线 apt 包预先提供。当前 `.4`
+已经满足这些条件。
 
-### 方式二：把仓库复制到目标设备后本地安装
+部署脚本使用同一个 SSH 复用连接，密码通常只输入一次；长期使用建议配置 SSH 公钥：
+`ssh-copy-id user@NEW_DEVICE_IP`。
+
+### 3. 目标机本地安装（可选）
+
+也可以先把仓库和 `offline/` 目录复制到目标机，再执行：
 
 ~~~bash
 scp -r /home/xense/tron2/taccap-websocket user@NEW_DEVICE_IP:~/
 ssh user@NEW_DEVICE_IP
 cd ~/taccap-websocket
-./install.sh --with-deps --install-system-deps --enable-systemd
+./install.sh --offline-dir ./offline --with-deps --enable-systemd
 ~~~
 
-install.sh 也支持只安装、不启动：
+`install.sh --offline-dir ... --with-deps --no-start` 可只安装不启动。安装脚本会保留
+已有的 `config/taccap.env`、日志和设备配置，不会把设备特定串口路径写回源码。
 
-~~~bash
-./install.sh --with-deps --no-start
-~~~
+### 有网络的目标机
 
-目标设备需要 Python 3.10 或更新版本。Ubuntu 20.04 的系统 Python 通常是 3.8；
-也可以显式指定已经安装好的 Python 3.12：
+如果目标机能联网，也可以使用 `--bootstrap-python` 和 `--install-system-deps`：
 
 ~~~bash
 ./deploy.sh user@NEW_DEVICE_IP \
-  --python /home/user/py312/bin/python \
-  --install-system-deps \
-  --enable-systemd
+  --bootstrap-python --install-system-deps --enable-systemd
 ~~~
 
-### 专有 SDK 依赖
-
-requirements.txt 包含 xensesdk 和 taccap-gripper。如果目标设备无法从当前
-Python 包索引下载这两个专有包，需要先把对应 wheel 拷贝到目标设备并安装，或者
-让 config/taccap.env 的 TACCAP_PYTHON 指向已经装好 SDK 的 Python：
-
-~~~bash
-python3 -m pip install /path/to/xensesdk-*.whl
-python3 -m pip install /path/to/taccap_gripper-*.whl
-~~~
-
-然后执行：
-
-~~~bash
-./install.sh --no-start
-~~~
-
-安装脚本不会覆盖已有的 config/taccap.env。设备差异应只写在这个文件中，不要写回
-server.py。
+该模式与离线模式互斥；新设备迁移优先使用上面的 bundle 方式。
 
 服务默认自动识别左右夹爪和六路相机。如果某批硬件的序列号命名规则不同，可复制
 config/devices.json.example 为 config/devices.json，填写目标设备的稳定 by-id 路径，

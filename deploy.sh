@@ -13,6 +13,7 @@ Options:
   --bootstrap-python      Install a private Python 3.12 with uv on the remote
   --env-script PATH       SDK environment script on the remote device
   --wheel-dir DIR         Local directory containing private SDK wheels
+  --offline-dir DIR       Local offline bundle (Python + all wheels)
   --no-deps               Do not create a virtualenv or install Python packages
   --install-system-deps   Install Ubuntu packages with apt (sudo required)
   --enable-systemd        Install and enable a user systemd service
@@ -28,6 +29,7 @@ base_python=""
 bootstrap_python=0
 wheel_dir=""
 env_script=""
+offline_dir=""
 with_deps=1
 install_system_deps=0
 enable_systemd=0
@@ -69,6 +71,11 @@ while (($#)); do
             wheel_dir="$2"
             shift 2
             ;;
+        --offline-dir)
+            (($# >= 2)) || { echo "missing argument for --offline-dir" >&2; exit 2; }
+            offline_dir="$2"
+            shift 2
+            ;;
         --no-deps)
             with_deps=0
             shift
@@ -96,6 +103,34 @@ while (($#)); do
             ;;
     esac
 done
+
+if [[ -n "$offline_dir" ]]; then
+    if ((bootstrap_python)); then
+        echo "--bootstrap-python cannot be combined with --offline-dir" >&2
+        exit 2
+    fi
+    if [[ -n "$base_python" ]]; then
+        echo "--python cannot be combined with --offline-dir" >&2
+        exit 2
+    fi
+    if ((install_system_deps)); then
+        echo "--install-system-deps cannot be combined with --offline-dir" >&2
+        echo "Install system packages before taking the target offline." >&2
+        exit 2
+    fi
+    if ((with_deps == 0)); then
+        echo "--no-deps cannot be combined with --offline-dir" >&2
+        exit 2
+    fi
+    if [[ -n "$wheel_dir" ]]; then
+        echo "--wheel-dir is redundant with --offline-dir" >&2
+        exit 2
+    fi
+    if [[ -n "$env_script" ]]; then
+        echo "--env-script is not portable with --offline-dir; configure libraries in the target image" >&2
+        exit 2
+    fi
+fi
 
 shell_quote() {
     local value="$1"
@@ -139,6 +174,9 @@ tar \
     --exclude='./taccap.log' \
     --exclude='./*.log' \
     --exclude='./.log' \
+    --exclude='./offline' \
+    --exclude='./.runtime' \
+    --exclude='./vendor' \
     --exclude='./__pycache__' \
     -czf - -C "$project_dir" . |
     remote_ssh "tar -xzf - -C $remote_tmp_q"
@@ -151,6 +189,20 @@ if [[ -n "$wheel_dir" ]]; then
         remote_ssh "tar -xzf - -C $remote_tmp_q/vendor-wheels"
 fi
 
+if [[ -n "$offline_dir" ]]; then
+    [[ -d "$offline_dir/python" && -d "$offline_dir/wheels" ]] || {
+        echo "offline bundle must contain python/ and wheels/: $offline_dir" >&2
+        exit 1
+    }
+    [[ -f "$offline_dir/manifest.txt" ]] || {
+        echo "offline bundle is missing manifest.txt: $offline_dir" >&2
+        exit 1
+    }
+    remote_ssh "mkdir -p -- $remote_tmp_q/offline"
+    tar -czf - -C "$offline_dir" python wheels manifest.txt |
+        remote_ssh "tar -xzf - -C $remote_tmp_q/offline"
+fi
+
 remote_cmd="set -e; bash $remote_tmp_q/install.sh"
 if [[ -n "$install_dir" ]]; then
     remote_cmd+=" --install-dir $(shell_quote "$install_dir")"
@@ -160,6 +212,9 @@ if [[ -n "$base_python" ]]; then
 fi
 if ((bootstrap_python)); then
     remote_cmd+=" --bootstrap-python"
+fi
+if [[ -n "$offline_dir" ]]; then
+    remote_cmd+=" --offline-dir $(shell_quote "$remote_tmp/offline")"
 fi
 if [[ -n "$env_script" ]]; then
     remote_cmd+=" --env-script $(shell_quote "$env_script")"

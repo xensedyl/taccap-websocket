@@ -8,6 +8,8 @@ __pycache__/
 *.bak
 *.bak.*
 .venv/
+.runtime/
+offline/
 !.log/
 .log/*
 !.log/.gitkeep
