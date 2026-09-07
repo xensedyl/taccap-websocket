@@ -11,8 +11,8 @@ pip, uv, Git, compiler or network access.
 
 Options:
   --output DIR             Output directory (default: ./offline)
-  --xensesdk-wheel PATH    xensesdk wheel (default: vendor/wheels/*.whl)
-  --taccap-wheel PATH      taccap-gripper wheel (default: vendor/wheels/*.whl)
+  --xensesdk-wheel PATH    xensesdk wheel (required; kept outside Git)
+  --taccap-wheel PATH      taccap-gripper wheel (required; kept outside Git)
   --python PATH            Resolver Python 3.12+ (default: python3)
   -h, --help               Show this help
 USAGE
@@ -35,16 +35,14 @@ while (($#)); do
     esac
 done
 
-if [[ -z "$xensesdk_wheel" ]]; then
-    xensesdk_wheel="$(find "$project_dir/vendor/wheels" -maxdepth 1 -type f \
-        -name 'xensesdk-*.whl' -print -quit 2>/dev/null || true)"
-fi
-if [[ -z "$taccap_wheel" ]]; then
-    taccap_wheel="$(find "$project_dir/vendor/wheels" -maxdepth 1 -type f \
-        -name 'taccap_gripper-*.whl' -print -quit 2>/dev/null || true)"
-fi
-[[ -f "$xensesdk_wheel" ]] || { echo "xensesdk wheel not found: $xensesdk_wheel" >&2; exit 1; }
-[[ -f "$taccap_wheel" ]] || { echo "taccap-gripper wheel not found: $taccap_wheel" >&2; exit 1; }
+[[ -n "$xensesdk_wheel" && -f "$xensesdk_wheel" ]] || {
+    echo "xensesdk wheel is required and must be outside Git; pass --xensesdk-wheel PATH" >&2
+    exit 1
+}
+[[ -n "$taccap_wheel" && -f "$taccap_wheel" ]] || {
+    echo "taccap-gripper wheel is required and must be outside Git; pass --taccap-wheel PATH" >&2
+    exit 1
+}
 command -v "$python_bin" >/dev/null 2>&1 || [[ -x "$python_bin" ]] || {
     echo "resolver Python not found: $python_bin" >&2; exit 1;
 }

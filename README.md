@@ -21,7 +21,7 @@ taccap-websocket/
 ├── bundle.sh                   # 本机生成完整离线发布包
 ├── deploy.sh                   # SSH 上传并一键安装/启动
 ├── packaging/                  # systemd 模板
-├── vendor/wheels/              # 私有 SDK wheel
+├── vendor/                     # 私有 SDK 说明（wheel 不进入 Git）
 └── .log/                       # 运行日志（不提交）
 ```
 
@@ -45,13 +45,13 @@ cd /home/xense/tron2/taccap-websocket
 - `xensesdk`、`taccap-gripper` 以及全部传递依赖 wheel；
 - `manifest.txt` 和每个 wheel 的 SHA256。
 
-默认私有 SDK wheel 位于 `vendor/wheels/`。如果 SDK wheel 不在默认位置，可以显式
-指定：
+私有 SDK wheel 不存入 Git 仓库。请从公司内部制品库、原设备备份或安全文件传输中
+准备到本机，例如 `/home/xense/sdk-wheels/`，然后显式指定路径：
 
 ```bash
 ./bundle.sh \
-  --xensesdk-wheel /path/to/xensesdk-*.whl \
-  --taccap-wheel /path/to/taccap_gripper-*.whl \
+  --xensesdk-wheel /home/xense/sdk-wheels/xensesdk-2.1.3-cp312-cp312-manylinux_2_31_x86_64.whl \
+  --taccap-wheel /home/xense/sdk-wheels/taccap_gripper-0.1.9-cp312-cp312-linux_x86_64.whl \
   --output ./offline
 ```
 
