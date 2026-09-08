@@ -37,11 +37,11 @@ LEASE_TIMEOUT_S = 5.0
 MAX_VELOCITY_RAD_S = 0.60
 MAX_TORQUE_NM = 0.25
 CLOSE_CONFIRM_THRESHOLD = 0.05
-# The tactile sensors negotiate their native MJPG/SDK stream at up to 120 Hz.
-# Keep the calibrated 640x480 input and publish every available Rectify sample
-# during this experiment; wrist cameras remain on the less bandwidth-hungry
-# 30 Hz path below.
-SDK_TACTILE_FPS = 120.0
+# Read, rectify and encode tactile samples at the same 30 Hz cadence used by
+# LeRobot and the wrist-camera streams.  Running four 700x400 Rectify encoders
+# at 120 Hz wastes CPU and network bandwidth without benefiting a 30 FPS
+# consumer.
+SDK_TACTILE_FPS = 30.0
 # ``xensesdk`` takes rectify_size in (width, height) order.  The returned
 # NumPy image is normally (height, width, channels), i.e. (700, 400, 3).
 # Keep these constants explicit so the bridge cannot silently fall back to the
@@ -53,7 +53,7 @@ TACTILE_RECTIFY_SHAPES = {
     (TACTILE_RECTIFY_WIDTH, TACTILE_RECTIFY_HEIGHT, 3),
 }
 CAMERA_STREAM_FPS = 30.0
-TACTILE_STREAM_FPS = 120.0
+TACTILE_STREAM_FPS = 30.0
 CAMERA_JPEG_QUALITY = max(
     60,
     min(95, int(os.environ.get("TACCAP_CAMERA_JPEG_QUALITY", "85"))),
@@ -1124,10 +1124,9 @@ class SdkTactileSource(FrameSource):
 
     ``raw_size=(640, 480)`` is fixed in the worker.  Rectify output remains
     ``rectify_size=(400, 700)`` (normally an array of shape ``(700, 400, 3)``).
-    The SDK's UVC backend negotiates MJPG at 120 Hz internally; this experiment
-    publishes/encodes each worker at a 120 Hz cadence.  The input remains the
-    original 640x480 frame and the HTTP stream still carries calibrated Rectify
-    output.
+    Each worker reads, rectifies and encodes at a 30 Hz cadence.  The input
+    remains the original 640x480 frame and the HTTP stream still carries
+    calibrated Rectify output.
     """
 
     _MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -1384,7 +1383,7 @@ class BridgeState:
             cv2.setNumThreads(1)
         self.tactile_mode = (
             "xensesdk Sensor.OutputType.Rectify "
-            "(rectify_size=(400, 700), one worker process per source, 120 Hz target)"
+            "(rectify_size=(400, 700), one worker process per source, 30 Hz target)"
             if Sensor is not None
             else "raw UVC MJPEG fallback (xensesdk unavailable; bandwidth-limited)"
         )
@@ -1463,7 +1462,7 @@ input[type=range] { flex:1; min-width:180px; }
 </head>
 <body>
 <h1>TacCap 远程控制</h1>
-<div class="hint">0 = 完全闭合，1 = 完全张开。电机使能后需要持续心跳；连接中断约 5 秒会自动断使能。四路触觉由设备端的四个独立采集进程持续读取，网页发布目标 120 Hz，腕部相机保持 30 Hz；网页只接收最新帧，不会因某一路浏览器卡住而拖慢其它路。触觉输入保持原始 640×480，使用 xensesdk Sensor.OutputType.Rectify（SDK 参数 rectify_size=(400, 700)，标定矫正）。</div>
+<div class="hint">0 = 完全闭合，1 = 完全张开。电机使能后需要持续心跳；连接中断约 5 秒会自动断使能。四路触觉由设备端的四个独立采集进程持续读取，触觉和腕部相机均以 30 Hz 发布；网页只接收最新帧，不会因某一路浏览器卡住而拖慢其它路。触觉输入保持原始 640×480，使用 xensesdk Sensor.OutputType.Rectify（SDK 参数 rectify_size=(400, 700)，标定矫正）。</div>
 <section class="controls" id="controls"></section>
 <section class="cameras" id="cameras"></section>
 <script>
@@ -1515,7 +1514,7 @@ async function refresh() {
 }
 async function loadCameras() {
   const data=await api('/api/cameras');
-  document.querySelector('#cameras').innerHTML=data.cameras.map(c=>`<article class="card camera"><h3>${c.label}</h3><img data-camera="${c.name}" data-stream-fps="${c.kind==='tactile_raw'?120:30}" src="${c.stream_url}" alt="${c.label}" decoding="async"><small id="camera-meta-${c.name}">${c.name} · 采集 ${c.source_fps===null?'--':c.source_fps} Hz</small></article>`).join('');
+  document.querySelector('#cameras').innerHTML=data.cameras.map(c=>`<article class="card camera"><h3>${c.label}</h3><img data-camera="${c.name}" data-stream-fps="30" src="${c.stream_url}" alt="${c.label}" decoding="async"><small id="camera-meta-${c.name}">${c.name} · 采集 ${c.source_fps===null?'--':c.source_fps} Hz</small></article>`).join('');
   for (const img of document.querySelectorAll('img[data-camera]')) {
     attachStreamRetry(img);
   }
@@ -1649,11 +1648,11 @@ def make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                                 and c["source_fps"] >= 27.0
                                 for c in cameras
                             ),
-                            "all_four_tactile_fresh_120hz": all(
+                            "all_four_tactile_fresh_30hz": all(
                                 c.get("available")
                                 and c.get("kind") == "tactile_raw"
                                 and isinstance(c.get("source_fps"), (int, float))
-                                and c["source_fps"] >= 108.0
+                                and c["source_fps"] >= 27.0
                                 for c in cameras
                                 if c.get("kind") == "tactile_raw"
                             ),
