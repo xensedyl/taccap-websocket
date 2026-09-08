@@ -1,10 +1,9 @@
 # Runtime dependencies for a fresh target device.
 #
-# Keep the versions in sync with the offline wheel bundle.  xensesdk is the
-# vendor wheel that provides Sensor.OutputType.Rectify; taccap-gripper is built
-# from the official TacCap-Gripper repository:
+# Runtime dependencies.  xensesdk is resolved by package name; taccap-gripper
+# is resolved and built directly from the official source repository:
 # https://github.com/XenseRobotics-AI/TacCap-Gripper
 numpy==2.2.4
 opencv-python==4.12.0.88
 xensesdk==2.1.3
-taccap-gripper==0.1.9
+taccap-gripper @ git+https://github.com/XenseRobotics-AI/TacCap-Gripper.git

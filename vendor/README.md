@@ -1,15 +1,33 @@
-# Offline SDK inputs
+# SDK 来源与离线发布
 
-The deployment bundle is generated on a machine that has network access. The
-target robot does not need network access.
+发布包在有网络且具备 C++ 编译器、OpenCV/spdlog 开发包的开发机上生成，目标设备不需要网络、
+pip、uv、Git 或编译器。
+构建 C++ 依赖在非系统前缀时，可设置 `TACCAP_CPP_PREFIX` 指向该前缀；脚本会把它
+加入 CMake 的搜索路径。
+如果构建机无法由 `uv` 下载 portable Python，可用 `TACCAP_BUNDLE_RUNTIME` 指定已
+准备好的 Python 3.12 runtime 目录。
 
-The private SDK wheels are deliberately **not stored in Git**. Keep them in a
-separate local directory or artifact store and pass their paths to `bundle.sh`.
-The TacCap-Gripper wheel is built from the official repository:
+- `xensesdk` 通过包名安装（默认 `xensesdk`，可用 `--xensesdk` 指定版本或内部
+  index）；
+- `taccap-gripper` 直接从源码目录或官方仓库构建安装：
+  `https://github.com/XenseRobotics-AI/TacCap-Gripper.git`；
+- 构建完成后只把已安装的 `site-packages.tar.gz` 放进 bundle；源码构建产生的
+  临时 wheel 不会进入 Git 或发布包。
 
-`https://github.com/XenseRobotics-AI/TacCap-Gripper.git`
+示例：
 
-Run `bundle.sh --xensesdk-wheel PATH --taccap-wheel PATH` to collect a
-compatible Python runtime, both private SDK wheels and all public Python
-wheels into the ignored `offline/` directory before deploying to an isolated
-target.
+```bash
+./bundle.sh \
+  --xensesdk 'xensesdk==2.1.3' \
+  --taccap-source /home/xense/tron2/TacCap-Gripper
+```
+
+或者让脚本从 Git URL 临时 clone：
+
+```bash
+./bundle.sh \
+  --taccap-source https://github.com/XenseRobotics-AI/TacCap-Gripper.git
+```
+
+目标设备收到的 bundle 只包含 portable Python、安装后的 site-packages 归档和
+校验清单，不包含任何 `.whl`。

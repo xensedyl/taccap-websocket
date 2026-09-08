@@ -13,7 +13,7 @@ dependencies = [
     "numpy==2.2.4",
     "opencv-python==4.12.0.88",
     "xensesdk==2.1.3",
-    "taccap-gripper==0.1.9",
+    "taccap-gripper @ git+https://github.com/XenseRobotics-AI/TacCap-Gripper.git",
 ]
 
 [project.scripts]

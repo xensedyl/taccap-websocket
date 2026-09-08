@@ -11,9 +11,9 @@ __pycache__/
 .venv/
 .runtime/
 offline/
-vendor/wheels/*.whl
 build/
 dist/
+vendor/wheels/*.whl
 !.log/
 .log/*
 !.log/.gitkeep

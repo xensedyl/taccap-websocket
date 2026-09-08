@@ -44,7 +44,7 @@ while (($#)); do
     esac
 done
 [[ -n "$target" ]] || { usage >&2; exit 2; }
-[[ -d "$bundle_dir/python" && -d "$bundle_dir/wheels" ]] || {
+[[ -d "$bundle_dir/python" && -f "$bundle_dir/site-packages.tar.gz" ]] || {
     echo "invalid offline bundle: $bundle_dir (run ./bundle.sh first)" >&2; exit 1;
 }
 [[ -f "$bundle_dir/manifest.txt" ]] || {
@@ -86,7 +86,9 @@ tar \
     -czf - -C "$project_dir" . |
     remote_ssh "tar -xzf - -C $remote_tmp_q/source"
 
-tar -czf - -C "$bundle_dir" python wheels manifest.txt |
+offline_files=(python site-packages.tar.gz manifest.txt)
+[[ -f "$bundle_dir/runtime-libs.tar.gz" ]] && offline_files+=(runtime-libs.tar.gz)
+tar -czf - -C "$bundle_dir" "${offline_files[@]}" |
     remote_ssh "tar -xzf - -C $remote_tmp_q/offline"
 remote_ssh "printf '%s\n' $(shell_quote "$commit") > $remote_tmp_q/source/.release"
 

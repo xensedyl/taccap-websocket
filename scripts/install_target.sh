@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Internal installer. It is called by ../deploy.sh on the target machine.
-# The target is offline: the bundle contains Python and every Python wheel.
+# The target is offline: the bundle contains Python and an installed
+# site-packages snapshot prepared on the connected build host.
 
 usage() {
     cat <<'USAGE'
@@ -11,7 +12,7 @@ Usage: install_target.sh --offline-dir DIR [options]
 Internal offline installer (normally invoked by deploy.sh).
 
 Options:
-  --offline-dir DIR   Bundle containing python/, wheels/ and manifest.txt
+  --offline-dir DIR   Bundle containing python/, site-packages.tar.gz and manifest.txt
   --install-dir DIR   Installation directory (default: $HOME/taccap-websocket)
   --no-start          Install without starting the service
   -h, --help          Show this help
@@ -42,9 +43,13 @@ done
 case "$install_dir" in /|/home|/root|/tmp)
     echo "refusing unsafe installation directory: $install_dir" >&2; exit 2;;
 esac
-[[ -d "$offline_dir/python" && -d "$offline_dir/wheels" ]] || {
-    echo "offline bundle must contain python/ and wheels/: $offline_dir" >&2; exit 1;
+[[ -d "$offline_dir/python" && -f "$offline_dir/site-packages.tar.gz" ]] || {
+    echo "offline bundle must contain python/ and site-packages.tar.gz: $offline_dir" >&2; exit 1;
 }
+if [[ -e "$offline_dir/runtime-libs.tar.gz" && ! -f "$offline_dir/runtime-libs.tar.gz" ]]; then
+    echo "offline runtime-libs.tar.gz is not a regular file" >&2
+    exit 1
+fi
 [[ -f "$offline_dir/manifest.txt" ]] || {
     echo "offline bundle is missing manifest.txt: $offline_dir" >&2; exit 1;
 }
@@ -67,7 +72,8 @@ awk 'BEGIN { hashes=0 } /^sha256:/ { hashes=1; next } hashes && NF { print }' \
 
 mkdir -p "$install_dir/.runtime"
 runtime_stage="$(mktemp -d "$install_dir/.runtime/.python.XXXXXX")"
-trap 'rm -rf -- "$runtime_stage"' EXIT
+runtime_cleanup() { rm -rf -- "$runtime_stage"; }
+trap runtime_cleanup EXIT
 tar -cf - -C "$offline_dir/python" . | tar -xf - -C "$runtime_stage"
 python_home="$install_dir/.runtime/python"
 if [[ -e "$python_home" ]]; then
@@ -77,10 +83,35 @@ if [[ -e "$python_home" ]]; then
     rm -rf -- "$python_home"
 fi
 mv -- "$runtime_stage" "$python_home"
+runtime_stage=""
 trap - EXIT
 : >"$install_dir/.runtime/.managed-by-taccap"
 base_python="$(find "$python_home" \( -type f -o -type l \) -path '*/bin/python3.12' -print -quit)"
 [[ -x "$base_python" ]] || { echo "offline bundle has no Python 3.12" >&2; exit 1; }
+
+runtime_lib_dir="$install_dir/.runtime/lib"
+if [[ -f "$offline_dir/runtime-libs.tar.gz" ]]; then
+    runtime_lib_stage="$(mktemp -d "$install_dir/.runtime/.lib.XXXXXX")"
+    tar -xzf "$offline_dir/runtime-libs.tar.gz" -C "$runtime_lib_stage"
+    if [[ -e "$runtime_lib_dir" ]]; then
+        [[ -f "$install_dir/.runtime/.managed-by-taccap" ]] || {
+            echo "refusing to replace unmanaged runtime library directory: $runtime_lib_dir" >&2
+            rm -rf -- "$runtime_lib_stage"
+            exit 1
+        }
+        rm -rf -- "$runtime_lib_dir"
+    fi
+    mv -- "$runtime_lib_stage" "$runtime_lib_dir"
+else
+    if [[ -e "$runtime_lib_dir" ]]; then
+        [[ -f "$install_dir/.runtime/.managed-by-taccap" ]] || {
+            echo "refusing to remove unmanaged runtime library directory: $runtime_lib_dir" >&2
+            exit 1
+        }
+        rm -rf -- "$runtime_lib_dir"
+    fi
+    runtime_lib_dir=""
+fi
 
 mkdir -p "$install_dir"
 saved_config_dir="$(mktemp -d)"
@@ -102,9 +133,23 @@ done
 rm -rf -- "$saved_config_dir"
 
 [[ -f "$install_dir/config/taccap.env" ]] || cp "$install_dir/config/taccap.env.example" "$install_dir/config/taccap.env"
+# Recreate the managed venv contents on every deployment.  This prevents a
+# removed dependency from surviving an upgrade as a stale package.
+"$base_python" -m venv --clear "$install_dir/.venv"
 python_bin="$install_dir/.venv/bin/python"
-"$base_python" -m venv "$install_dir/.venv"
-"$python_bin" -m pip install --no-index --find-links "$offline_dir/wheels" -r "$install_dir/requirements.txt"
+site_packages="$($python_bin -c 'import site; print(site.getsitepackages()[0])')"
+[[ -d "$site_packages" ]] || { echo "target venv site-packages not found: $site_packages" >&2; exit 1; }
+tar -xzf "$offline_dir/site-packages.tar.gz" -C "$site_packages"
+if [[ -n "$runtime_lib_dir" ]]; then
+    export LD_LIBRARY_PATH="$runtime_lib_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+"$python_bin" - <<'PY'
+import importlib
+
+for module in ("xensesdk", "xense.taccap"):
+    importlib.import_module(module)
+    print(f"verified import: {module}")
+PY
 
 set_config_value() {
     local name="$1" value="$2" tmp
@@ -120,6 +165,7 @@ set_config_value() {
 set_config_value TACCAP_PYTHON "$python_bin"
 set_config_value TACCAP_ENV_SCRIPT ""
 set_config_value TACCAP_PYTHON_HOME "$install_dir/.runtime/python"
+set_config_value TACCAP_LD_LIBRARY_PATH "${runtime_lib_dir:-}"
 
 chmod +x "$install_dir/scripts/taccap.sh"
 for legacy_file in server.py tactile_worker.py client.py taccap.sh install.sh bundle_offline.sh; do
