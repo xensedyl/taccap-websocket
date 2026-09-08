@@ -37,6 +37,33 @@ LEASE_TIMEOUT_S = 5.0
 MAX_VELOCITY_RAD_S = 0.60
 MAX_TORQUE_NM = 0.25
 CLOSE_CONFIRM_THRESHOLD = 0.05
+CONTROL_MODE_POSITION = "position"
+CONTROL_MODE_MIT = "mit"
+CONTROL_MODES = (CONTROL_MODE_POSITION, CONTROL_MODE_MIT)
+
+
+def _configured_float(name: str, default: float) -> float:
+    value = os.environ.get(name, str(default)).strip()
+    try:
+        result = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be numeric, got {value!r}") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return result
+
+
+MIT_KP_NM_PER_RAD = _configured_float("TACCAP_MIT_KP", 8.0)
+MIT_KD_NM_S_PER_RAD = _configured_float("TACCAP_MIT_KD", 1.0)
+MIT_FEEDFORWARD_TORQUE_NM = _configured_float("TACCAP_MIT_FEEDFORWARD_TORQUE", 0.0)
+
+MOTOR_MODE_NAMES = {
+    0: "idle",
+    1: CONTROL_MODE_POSITION,
+    2: "velocity",
+    3: "torque",
+    4: "impedance (MIT)",
+}
 # Read, rectify and encode tactile samples at the same 30 Hz cadence used by
 # LeRobot and the wrist-camera streams.  Running four 700x400 Rectify encoders
 # at 120 Hz wastes CPU and network bandwidth without benefiting a 30 FPS
@@ -408,7 +435,12 @@ class ApiError(Exception):
 class GripperController:
     """Own one serial transport and serialize all commands sent over it."""
 
-    def __init__(self, spec: GripperSpec, taccap_module: Any):
+    def __init__(
+        self,
+        spec: GripperSpec,
+        taccap_module: Any,
+        control_mode: str | None = None,
+    ):
         self.spec = spec
         self.taccap = taccap_module
         self.lock = threading.RLock()
@@ -416,8 +448,20 @@ class GripperController:
         self.config: Any | None = None
         self.armed = False
         self.last_lease = 0.0
+        # Firmware may return the pre-enable status for a short interval after
+        # the enable ACK.  Do not let the status poller revoke the service
+        # lease during that transition.
+        self._enable_grace_until = 0.0
         self.target_position: float | None = None
         self.last_error: str | None = None
+        if control_mode is None:
+            side_mode = os.environ.get(
+                f"TACCAP_{spec.side.upper()}_GRIPPER_CONTROL_MODE", ""
+            ).strip()
+            control_mode = side_mode or os.environ.get(
+                "TACCAP_GRIPPER_CONTROL_MODE", CONTROL_MODE_POSITION
+            )
+        self.control_mode = self._validate_control_mode(control_mode)
         self.last_connect_attempt = 0.0
         self.status_condition = threading.Condition()
         self.latest_status: dict[str, Any] | None = None
@@ -426,6 +470,35 @@ class GripperController:
         self.status_thread: threading.Thread | None = None
         if self.connect():
             self._start_status_reader()
+
+    @staticmethod
+    def _validate_control_mode(value: str) -> str:
+        mode = str(value).strip().lower()
+        if mode not in CONTROL_MODES:
+            choices = ", ".join(CONTROL_MODES)
+            raise ValueError(f"unsupported gripper control mode {value!r}; choose {choices}")
+        return mode
+
+    def set_control_mode(self, mode: str) -> dict[str, Any]:
+        """Select the command primitive used by subsequent position requests.
+
+        ``mit`` sends the SDK's no-ACK impedance frame with the configured
+        gains.  It is deliberately a command-mode selection, not a persistent
+        change to the motor's CAN protocol; the firmware status reports mode 4
+        after the first MIT command is applied.
+        """
+
+        mode = self._validate_control_mode(mode)
+        with self.lock:
+            previous = self.control_mode
+            self.control_mode = mode
+            LOG.info(
+                "%s gripper command mode changed: %s -> %s",
+                self.spec.side,
+                previous,
+                mode,
+            )
+        return self.status()
 
     def _stop_transport_locked(self) -> None:
         if self.gripper is None:
@@ -498,6 +571,7 @@ class GripperController:
             self.gripper = gripper
             self.config = config
             self.armed = False
+            self._enable_grace_until = 0.0
             self.target_position = None
             self.last_error = None
             LOG.info(
@@ -568,7 +642,11 @@ class GripperController:
                         sample = gripper.motor.read_status(500)
                         raw_status = int(sample.status)
                         hardware_enabled = bool(raw_status & 0x0001)
-                        if self.armed and not hardware_enabled:
+                        if (
+                            self.armed
+                            and not hardware_enabled
+                            and time.monotonic() >= self._enable_grace_until
+                        ):
                             self.armed = False
                             self.last_lease = 0.0
                         normalized = min(1.0, max(0.0, float(gripper.rad_to_pos(float(sample.actual_pos)))))
@@ -599,6 +677,15 @@ class GripperController:
                             "target_position": self.target_position,
                             "firmware_target_rad": float(sample.target_pos),
                             "control_mode": int(sample.control_mode),
+                            "control_mode_name": MOTOR_MODE_NAMES.get(
+                                int(sample.control_mode), "unknown"
+                            ),
+                            "command_mode": self.control_mode,
+                            "mit_gains": {
+                                "kp_nm_per_rad": MIT_KP_NM_PER_RAD,
+                                "kd_nm_s_per_rad": MIT_KD_NM_S_PER_RAD,
+                                "feedforward_torque_nm": MIT_FEEDFORWARD_TORQUE_NM,
+                            },
                             "config": {
                                 "flags": int(cfg.flags),
                                 "max_open_rad": float(cfg.max_open_rad),
@@ -657,6 +744,7 @@ class GripperController:
                 gripper.motor.enable()
                 self.armed = True
                 self.last_lease = time.monotonic()
+                self._enable_grace_until = self.last_lease + 0.75
                 self.last_error = None
             except Exception as exc:
                 if self._is_serial_error(exc) and self._reconnect_after_serial_error_locked(exc):
@@ -665,12 +753,14 @@ class GripperController:
                         self.gripper.motor.enable()
                         self.armed = True
                         self.last_lease = time.monotonic()
+                        self._enable_grace_until = self.last_lease + 0.75
                         self.last_error = None
                         return self.status()
                     except Exception as retry_exc:
                         exc = retry_exc
                 self.armed = False
                 self.last_error = f"{type(exc).__name__}: {exc}"
+                self._enable_grace_until = 0.0
                 raise ApiError(HTTPStatus.CONFLICT, self.last_error) from exc
         return self.status()
 
@@ -686,6 +776,7 @@ class GripperController:
             finally:
                 self.armed = False
                 self.last_lease = 0.0
+                self._enable_grace_until = 0.0
         return self.status()
 
     def heartbeat(self) -> dict[str, Any]:
@@ -716,19 +807,32 @@ class GripperController:
                 )
             try:
                 target_rad = float(gripper.pos_to_rad(position))
-                gripper.motor.set_position(
-                    target_rad,
-                    MAX_VELOCITY_RAD_S,
-                    MAX_TORQUE_NM,
-                )
+                if self.control_mode == CONTROL_MODE_MIT:
+                    # TacCap's MIT force-position primitive is an impedance
+                    # frame.  The no-ACK path avoids serial round trips in a
+                    # realtime remote control loop; the status reader remains
+                    # responsible for health/feedback polling.
+                    gripper.motor.submit_impedance(
+                        target_rad,
+                        MIT_KP_NM_PER_RAD,
+                        MIT_KD_NM_S_PER_RAD,
+                        MIT_FEEDFORWARD_TORQUE_NM,
+                    )
+                else:
+                    gripper.motor.set_position(
+                        target_rad,
+                        MAX_VELOCITY_RAD_S,
+                        MAX_TORQUE_NM,
+                    )
                 self.target_position = position
                 self.last_lease = time.monotonic()
                 self.last_error = None
                 LOG.info(
-                    "%s target position=%.3f raw=%.4f rad",
+                    "%s target position=%.3f raw=%.4f rad mode=%s",
                     self.spec.side,
                     position,
                     target_rad,
+                    self.control_mode,
                 )
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"
@@ -749,6 +853,7 @@ class GripperController:
             finally:
                 self.armed = False
                 self.last_lease = 0.0
+                self._enable_grace_until = 0.0
 
     def status(self) -> dict[str, Any]:
         with self.status_condition:
@@ -757,6 +862,12 @@ class GripperController:
             with self.lock:
                 value["armed"] = self.armed
                 value["target_position"] = self.target_position
+                value["command_mode"] = self.control_mode
+                value["mit_gains"] = {
+                    "kp_nm_per_rad": MIT_KP_NM_PER_RAD,
+                    "kd_nm_s_per_rad": MIT_KD_NM_S_PER_RAD,
+                    "feedforward_torque_nm": MIT_FEEDFORWARD_TORQUE_NM,
+                }
                 value["lease_remaining_s"] = round(
                     max(0.0, LEASE_TIMEOUT_S - (time.monotonic() - self.last_lease))
                     if self.armed
@@ -783,6 +894,12 @@ class GripperController:
             "armed": self.armed,
             "enabled": False,
             "lease_remaining_s": 0.0,
+            "command_mode": self.control_mode,
+            "mit_gains": {
+                "kp_nm_per_rad": MIT_KP_NM_PER_RAD,
+                "kd_nm_s_per_rad": MIT_KD_NM_S_PER_RAD,
+                "feedforward_torque_nm": MIT_FEEDFORWARD_TORQUE_NM,
+            },
             "last_error": error,
         }
 
@@ -1462,7 +1579,7 @@ input[type=range] { flex:1; min-width:180px; }
 </head>
 <body>
 <h1>TacCap 远程控制</h1>
-<div class="hint">0 = 完全闭合，1 = 完全张开。电机使能后需要持续心跳；连接中断约 5 秒会自动断使能。四路触觉由设备端的四个独立采集进程持续读取，触觉和腕部相机均以 30 Hz 发布；网页只接收最新帧，不会因某一路浏览器卡住而拖慢其它路。触觉输入保持原始 640×480，使用 xensesdk Sensor.OutputType.Rectify（SDK 参数 rectify_size=(400, 700)，标定矫正）。</div>
+<div class="hint">0 = 完全闭合，1 = 完全张开。电机使能后需要持续心跳；连接中断约 5 秒会自动断使能。四路触觉由设备端的四个独立采集进程持续读取，触觉和腕部相机均以 30 Hz 发布；网页只接收最新帧，不会因某一路浏览器卡住而拖慢其它路。触觉采集输入为 640×480，使用 xensesdk Sensor.OutputType.Rectify 输出 700×400 标定矫正图。</div>
 <section class="controls" id="controls"></section>
 <section class="cameras" id="cameras"></section>
 <script>
@@ -1476,11 +1593,16 @@ async function api(path, options={}) {
 }
 function controlCard(side) {
   return `<article class="card"><h2>${labels[side]}</h2>
+    <div class="row"><label for="mode-${side}">控制模式</label>
+      <select id="mode-${side}" onchange="changeMode('${side}',this.value)">
+        <option value="position">Position 位置模式</option>
+        <option value="mit">MIT 阻抗模式</option>
+      </select></div>
     <div class="row">
       <button class="enable" onclick="enableSide('${side}')">使能</button>
       <button class="disable" onclick="disableSide('${side}')">断使能</button>
       <button class="open" onclick="moveSide('${side}',1,false)">完全张开</button>
-      <button class="close" onclick="closeSide('${side}')">完全闭合</button>
+      <button class="close" onclick="moveSide('${side}',0,true)">完全闭合</button>
     </div>
     <div class="row"><span>位置</span><input id="slider-${side}" type="range" min="0" max="1" step="0.01" value="1">
       <output id="value-${side}">1.00</output><button onclick="sendSlider('${side}')">发送</button></div>
@@ -1493,9 +1615,9 @@ for (const side of ['left','right']) {
 }
 async function enableSide(side) { try { await api(`/api/grippers/${side}/enable`,{method:'POST',body:'{}'}); armed[side]=true; await refresh(); } catch(e){alert(e.message);} }
 async function disableSide(side) { try { await api(`/api/grippers/${side}/disable`,{method:'POST',body:'{}'}); armed[side]=false; await refresh(); } catch(e){alert(e.message);} }
+async function changeMode(side, mode) { try { await api(`/api/grippers/${side}/control_mode`,{method:'POST',body:JSON.stringify({mode})}); await refresh(); } catch(e){alert(e.message); await refresh();} }
 async function moveSide(side, position, confirm_close) { try { await api(`/api/grippers/${side}/position`,{method:'POST',body:JSON.stringify({position,confirm_close})}); await refresh(); } catch(e){alert(e.message);} }
-function closeSide(side) { if(confirm(`确认让${labels[side]}完全闭合？请确保夹爪内没有手指或易损物。`)) moveSide(side,0,true); }
-function sendSlider(side) { const p=Number(document.querySelector(`#slider-${side}`).value); if(p<=0.05 && !confirm(`位置 ${p.toFixed(2)} 接近完全闭合，确认继续？`)) return; moveSide(side,p,p<=0.05); }
+function sendSlider(side) { const p=Number(document.querySelector(`#slider-${side}`).value); moveSide(side,p,p<=0.05); }
 async function refresh() {
   try {
     const all=await api('/api/grippers');
@@ -1503,8 +1625,11 @@ async function refresh() {
       const s=all.grippers[side];
       armed[side]=Boolean(s.armed);
       const cls=s.available?'ok':'bad';
+      const mode=document.querySelector(`#mode-${side}`);
+      if (mode && document.activeElement !== mode && s.command_mode) mode.value=s.command_mode;
       document.querySelector(`#status-${side}`).innerHTML=`<span class="${cls}">${s.available?'在线':'不可用'}</span>\n`+
         `位置: ${s.position===undefined?'--':s.position.toFixed(3)}  原始: ${s.raw_position_rad===undefined?'--':s.raw_position_rad.toFixed(4)} rad\n`+
+        `命令模式: ${(s.command_mode||'--').toUpperCase()}  电机模式: ${s.control_mode_name||'--'} (${s.control_mode===undefined?'--':s.control_mode})\n`+
         `使能: ${s.enabled?'是':'否'}  服务已授权: ${s.armed?'是':'否'}  剩余: ${Number(s.lease_remaining_s||0).toFixed(1)} s\n`+
         `速度: ${s.velocity_rad_s===undefined?'--':s.velocity_rad_s.toFixed(3)} rad/s  力矩: ${s.torque_nm===undefined?'--':s.torque_nm.toFixed(3)} Nm\n`+
         `温度: ${s.motor_temp_c===undefined?'--':s.motor_temp_c.toFixed(1)} °C  状态: ${(s.status_flags||[]).join(', ')||'--'}\n`+
@@ -1789,6 +1914,14 @@ def make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     result = controller.disable()
                 elif action == "heartbeat":
                     result = controller.heartbeat()
+                elif action in {"control_mode", "mode"}:
+                    mode = body.get("mode", body.get("control_mode"))
+                    if not isinstance(mode, str):
+                        raise ApiError(
+                            HTTPStatus.BAD_REQUEST,
+                            "mode must be one of: position, mit",
+                        )
+                    result = controller.set_control_mode(mode)
                 elif action == "position":
                     if "position" not in body:
                         raise ApiError(HTTPStatus.BAD_REQUEST, "missing position")

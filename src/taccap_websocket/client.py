@@ -68,6 +68,14 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(action)
         p.add_argument("side", choices=("left", "right"))
 
+    p = sub.add_parser(
+        "mode",
+        aliases=("control-mode",),
+        help="show or set the command mode (position or mit)",
+    )
+    p.add_argument("side", choices=("left", "right"))
+    p.add_argument("mode", nargs="?", choices=("position", "mit"))
+
     p = sub.add_parser("position")
     p.add_argument("side", choices=("left", "right"))
     p.add_argument("position", type=float)
@@ -110,6 +118,17 @@ def main() -> int:
         print_json(request(base, "/api/cameras"))
     elif args.command in {"enable", "disable", "heartbeat"}:
         print_json(request(base, f"/api/grippers/{args.side}/{args.command}", {}))
+    elif args.command in {"mode", "control-mode"}:
+        if args.mode is None:
+            print_json(request(base, f"/api/grippers/{args.side}"))
+        else:
+            print_json(
+                request(
+                    base,
+                    f"/api/grippers/{args.side}/control_mode",
+                    {"mode": args.mode},
+                )
+            )
     elif args.command in {"position", "open", "close"}:
         if args.command == "position":
             position = args.position

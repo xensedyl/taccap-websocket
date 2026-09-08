@@ -3,7 +3,7 @@
 TacCap 双夹爪、四路触觉和两路腕部相机的设备端服务。服务直接运行在连接
 USB 设备的机器人主机上，通过 HTTP 向局域网中的 LeRobot 或其他控制端提供：
 
-- 左右夹爪状态、使能、位置控制和 5 秒安全租约；
+- 左右夹爪状态、使能、位置控制、MIT 阻抗控制和 5 秒安全租约；
 - `left_wrist`、`right_wrist` 两路腕部视频；
 - `left_tactile_left/right`、`right_tactile_left/right` 四路触觉视频；
 - `/api/health`、`/api/grippers`、`/api/cameras` 诊断接口。
@@ -138,7 +138,47 @@ cd ~/taccap-websocket
 curl http://10.192.1.4:8765/api/health
 curl http://10.192.1.4:8765/api/grippers
 curl http://10.192.1.4:8765/api/cameras
+
+# 查询当前命令模式
+curl http://10.192.1.4:8765/api/grippers/left
+
+# 切换左夹爪到 MIT 阻抗模式
+curl -X POST http://10.192.1.4:8765/api/grippers/left/control_mode \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"mit"}'
 ```
+
+夹爪控制模式
+--------------
+
+服务支持两种夹爪命令模式，默认是 `position`，以保持旧客户端兼容：
+
+- `position`：发送 SDK 的位置控制命令，使用最大速度和最大力矩限制；
+- `mit`：发送 SDK 的 MIT 阻抗帧 `submit_impedance()`，使用目标位置、`kp`、
+  `kd` 和前馈力矩。该模式使用无 ACK 的实时发送路径，适合 30 Hz 的遥操作。
+
+Web 页面中可以分别为左右夹爪选择模式。命令行客户端也可以选择：
+
+```bash
+taccap-client --base http://10.192.1.4:8765 mode left mit
+taccap-client --base http://10.192.1.4:8765 mode right position
+taccap-client --base http://10.192.1.4:8765 mode left
+```
+
+模式默认值可以在目标机 `config/taccap.env` 中设置：
+
+```bash
+TACCAP_GRIPPER_CONTROL_MODE=mit
+# 或只覆盖一侧
+TACCAP_LEFT_GRIPPER_CONTROL_MODE=mit
+TACCAP_RIGHT_GRIPPER_CONTROL_MODE=position
+```
+
+MIT 参数默认是 `kp=8.0`、`kd=1.0`、前馈力矩 `0.0 Nm`，可以通过
+`TACCAP_MIT_KP`、`TACCAP_MIT_KD` 和 `TACCAP_MIT_FEEDFORWARD_TORQUE` 调整。
+服务状态中的 `command_mode` 表示当前选中的命令路径，`control_mode` 和
+`control_mode_name` 表示电机最后实际应用的固件控制模式；切换模式后发送第一条
+位置命令，后者会更新为对应的 Position 或 Impedance (MIT)。
 
 日志统一保存到目标机项目的 `.log/`，文件名包含日期、时间和进程号，例如：
 
