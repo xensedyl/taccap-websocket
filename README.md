@@ -228,7 +228,8 @@ TACCAP_RIGHT_GRIPPER_CONTROL_MODE=position
 发送的是 MIT impedance 帧，`control_mode_name` 会显示 `impedance (MIT)`。
 
 调试时可以通过 Web 页面每个夹爪卡片中的“应用调参”修改当前或指定模式的
-`kp`、`kd`、前馈力矩、位置误差力矩上限和目标速度。也可以直接调用 REST API：
+`kp`、`kd`、有符号的基础前馈力矩、速度前馈上限、位置误差力矩上限和目标速度。
+也可以直接调用 REST API：
 
 ```bash
 # 查询当前参数和安全范围
@@ -238,17 +239,22 @@ curl http://10.192.1.4:8765/api/grippers/left/control_parameters
 curl -X POST http://10.192.1.4:8765/api/grippers/left/control_parameters \
   -H 'Content-Type: application/json' \
   -d '{"mode":"mit","kp_nm_per_rad":12,"kd_nm_s_per_rad":1.5,
-       "feedforward_torque_nm":0,"max_position_torque_nm":0.25,
+       "feedforward_torque_nm":0,"speed_feedforward_limit_nm":1.0,
+       "max_position_torque_nm":0.25,
        "target_max_velocity_rad_s":0.6}'
 ```
 
 参数有服务端安全上限，当前分别是 `kp≤100`、`kd≤50`、前馈力矩绝对值
-`≤2 Nm`、位置误差力矩上限 `≤2 Nm`、目标速度 `≤4 rad/s`。目标速度现在同时用于
+`≤2 Nm`、速度前馈上限 `0–2 Nm`、位置误差力矩上限 `≤2 Nm`、目标速度 `≤4 rad/s`。
+目标速度现在同时用于
 反馈目标和 MIT 速度前馈：桥接层根据实际位置、开合方向和 `kd` 计算有界的
 速度前馈力矩，并在每个电机状态周期更新；用户前馈与速度前馈的合计值受
-`±2 Nm` 上限约束，ControlLoop 和固件仍会执行各自的力矩与堵转保护。页面中的
+`±2 Nm` 上限约束，ControlLoop 和固件仍会执行各自的力矩与堵转保护。速度前馈先独立限制在
+`±speed_feedforward_limit_nm`，再与有符号的基础前馈相加，因此将速度前馈上限设为 `1 Nm`
+时，张开和闭合方向的速度分量都不会超过 `±1 Nm`。页面中的
 “速度”是电机实际反馈，“目标”
-是请求值，“速度前馈力矩”用于诊断实际是否有速度驱动力。设置为 `0` 会关闭速度
+是请求值，“速度前馈力矩”是限幅后实际参与合成的速度分量，“合计前馈”是最终
+传给 `ControlLoop` 的基础与速度前馈之和。将目标速度设为 `0` 会关闭速度
 前馈和目标斜坡，恢复为普通位置阻抗跟踪。由于电机负载、力矩上限和堵转保护的影响，
 目标速度是受安全约束的运动目标，不保证任何负载下都能达到该数值；当速度目标较高
 而 `kd × 目标速度` 超过前馈上限时，速度会因饱和而低于设定值。因此默认

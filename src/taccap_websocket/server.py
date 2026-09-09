@@ -75,6 +75,14 @@ MAX_DEBUG_KP_NM_PER_RAD = 100.0
 MAX_DEBUG_KD_NM_S_PER_RAD = 50.0
 MAX_DEBUG_FEEDFORWARD_TORQUE_NM = 2.0
 MAX_DEBUG_POSITION_TORQUE_NM = 2.0
+DEFAULT_SPEED_FEEDFORWARD_LIMIT_NM = _configured_float(
+    "TACCAP_SPEED_FEEDFORWARD_LIMIT_NM", MAX_DEBUG_FEEDFORWARD_TORQUE_NM
+)
+if not 0.0 <= DEFAULT_SPEED_FEEDFORWARD_LIMIT_NM <= MAX_DEBUG_FEEDFORWARD_TORQUE_NM:
+    raise ValueError(
+        "TACCAP_SPEED_FEEDFORWARD_LIMIT_NM must be between 0 and "
+        f"{MAX_DEBUG_FEEDFORWARD_TORQUE_NM} Nm"
+    )
 SPEED_CONTROL_POSITION_TOLERANCE = 0.002
 
 MOTOR_MODE_NAMES = {
@@ -497,6 +505,7 @@ class GripperController:
         }
         self.max_position_torque_nm = MAX_TORQUE_NM
         self.target_max_velocity_rad_s = DEFAULT_TARGET_MAX_VELOCITY_RAD_S
+        self.speed_feedforward_limit_nm = DEFAULT_SPEED_FEEDFORWARD_LIMIT_NM
         # Default SDK limits are intentionally kept separate from the old
         # position-command constants; this is the constructor safety clamp.
         self.last_connect_attempt = 0.0
@@ -569,7 +578,15 @@ class GripperController:
             "feedforward_torque_nm": ff,
             "max_position_torque_nm": self.max_position_torque_nm,
             "target_max_velocity_rad_s": self.target_max_velocity_rad_s,
+            "speed_feedforward_limit_nm": self.speed_feedforward_limit_nm,
             "speed_feedforward_torque_nm": self.speed_feedforward_torque_nm,
+            "applied_feedforward_torque_nm": min(
+                MAX_DEBUG_FEEDFORWARD_TORQUE_NM,
+                max(
+                    -MAX_DEBUG_FEEDFORWARD_TORQUE_NM,
+                    ff + self.speed_feedforward_torque_nm,
+                ),
+            ),
             "control_loop_hz": CONTROL_LOOP_HZ,
             "motor_stream_hz": MOTOR_STREAM_HZ,
             "submit_phase": "STREAM_LOCKED",
@@ -582,6 +599,7 @@ class GripperController:
                 ],
                 "max_position_torque_nm": [0.0, MAX_DEBUG_POSITION_TORQUE_NM],
                 "target_max_velocity_rad_s": [0.0, MAX_TARGET_MAX_VELOCITY_RAD_S],
+                "speed_feedforward_limit_nm": [0.0, MAX_DEBUG_FEEDFORWARD_TORQUE_NM],
             },
         }
 
@@ -630,6 +648,11 @@ class GripperController:
             "max_velocity_rad_s",
             "velocity_rad_s",
         )
+        speed_feedforward_limit = self._parameter_float(
+            body,
+            "speed_feedforward_limit_nm",
+            "velocity_feedforward_limit_nm",
+        )
         for name, value in updates.items():
             if value is None:
                 continue
@@ -644,6 +667,13 @@ class GripperController:
             raise ApiError(HTTPStatus.BAD_REQUEST, "max_position_torque_nm is outside the safety range")
         if target_velocity is not None and not 0.0 <= target_velocity <= MAX_TARGET_MAX_VELOCITY_RAD_S:
             raise ApiError(HTTPStatus.BAD_REQUEST, "target_max_velocity_rad_s is outside the safety range")
+        if (
+            speed_feedforward_limit is not None
+            and not 0.0
+            <= speed_feedforward_limit
+            <= MAX_DEBUG_FEEDFORWARD_TORQUE_NM
+        ):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "speed_feedforward_limit_nm is outside the safety range")
 
         with self.lock:
             previous_mode = self.control_mode
@@ -656,6 +686,9 @@ class GripperController:
                 # Remove the contribution calculated for the previous speed;
                 # the next status frame will derive a fresh value from the
                 # measured direction and velocity.
+                self.speed_feedforward_torque_nm = 0.0
+            if speed_feedforward_limit is not None:
+                self.speed_feedforward_limit_nm = speed_feedforward_limit
                 self.speed_feedforward_torque_nm = 0.0
             if previous_mode != mode:
                 self.speed_feedforward_torque_nm = 0.0
@@ -671,7 +704,7 @@ class GripperController:
                 self._apply_control_gains_locked()
             LOG.info(
                 "%s control parameters updated: mode=%s kp=%.3f kd=%.3f "
-                "ff=%.3f torque_limit=%.3f target_speed=%.3f",
+                "ff=%.3f torque_limit=%.3f target_speed=%.3f speed_ff_limit=%.3f",
                 self.spec.side,
                 mode,
                 self._mode_gains[mode]["kp_nm_per_rad"],
@@ -679,6 +712,7 @@ class GripperController:
                 self._mode_gains[mode]["feedforward_torque_nm"],
                 self.max_position_torque_nm,
                 self.target_max_velocity_rad_s,
+                self.speed_feedforward_limit_nm,
             )
             if previous_mode != mode:
                 LOG.info(
@@ -768,7 +802,10 @@ class GripperController:
                 # tau = kp*error + kd*(desired_velocity-actual_velocity)
                 # while the one-tick position target remains a small tracking
                 # correction.
-                requested_speed_ff = raw_direction * abs(kd) * speed
+                requested_speed_ff = raw_direction * min(
+                    self.speed_feedforward_limit_nm,
+                    abs(kd) * speed,
+                )
                 total_ff = min(
                     MAX_DEBUG_FEEDFORWARD_TORQUE_NM,
                     max(
@@ -776,6 +813,10 @@ class GripperController:
                         base_ff + requested_speed_ff,
                     ),
                 )
+                # Report only the contribution that is actually left for
+                # speed after the signed base bias and total +/-2 Nm clamp.
+                # This guarantees |speed_ff| never exceeds the independently
+                # configured speed-feed-forward limit.
                 speed_ff = total_ff - base_ff
 
         if abs(speed_ff - self.speed_feedforward_torque_nm) <= 1e-6:
@@ -2008,12 +2049,13 @@ function controlCard(side) {
     <div class="tuning" title="新版 SDK 的 position 和 mit 都通过 ControlLoop 发送阻抗帧">
       <label>kp (Nm/rad)<input id="kp-${side}" type="number" min="0" max="100" step="0.1"></label>
       <label>kd (Nm·s/rad)<input id="kd-${side}" type="number" min="0" max="50" step="0.1"></label>
-      <label>前馈力矩 (Nm)<input id="ff-${side}" type="number" min="-2" max="2" step="0.01"></label>
+      <label>基础前馈力矩 (Nm，有符号)<input id="ff-${side}" type="number" min="-2" max="2" step="0.01"></label>
+      <label>速度前馈上限 (Nm)<input id="speed-ff-limit-${side}" type="number" min="0" max="2" step="0.01"></label>
       <label>位置误差力矩上限 (Nm)<input id="limit-${side}" type="number" min="0" max="2" step="0.01"></label>
       <label>目标速度 (rad/s)<input id="speed-${side}" type="number" min="0" max="4" step="0.01"></label>
       <label>状态流频率 (Hz)<input value="100" disabled></label>
     </div>
-    <div class="row"><button class="tune" onclick="applyTuning('${side}')">应用调参</button><small>速度为主机目标斜坡限制；0=关闭</small></div>
+    <div class="row"><button class="tune" onclick="applyTuning('${side}')">应用调参</button><small>速度为主机目标斜坡限制；速度前馈上限是无符号幅值</small></div>
     <div class="status" id="status-${side}">读取中…</div></article>`;
 }
 document.querySelector('#controls').innerHTML = controlCard('left') + controlCard('right');
@@ -2027,7 +2069,7 @@ async function changeMode(side, mode) { try { await api(`/api/grippers/${side}/c
 async function moveSide(side, position, confirm_close) { try { await api(`/api/grippers/${side}/position`,{method:'POST',body:JSON.stringify({position,confirm_close})}); await refresh(); } catch(e){alert(e.message);} }
 async function applyTuning(side) {
   const n=id=>Number(document.querySelector(`#${id}-${side}`).value);
-  const body={mode:document.querySelector(`#mode-${side}`).value,kp_nm_per_rad:n('kp'),kd_nm_s_per_rad:n('kd'),feedforward_torque_nm:n('ff'),max_position_torque_nm:n('limit'),target_max_velocity_rad_s:n('speed')};
+  const body={mode:document.querySelector(`#mode-${side}`).value,kp_nm_per_rad:n('kp'),kd_nm_s_per_rad:n('kd'),feedforward_torque_nm:n('ff'),speed_feedforward_limit_nm:n('speed-ff-limit'),max_position_torque_nm:n('limit'),target_max_velocity_rad_s:n('speed')};
   try { await api(`/api/grippers/${side}/control_parameters`,{method:'POST',body:JSON.stringify(body)}); await refresh(); }
   catch(e) { alert(e.message); }
 }
@@ -2042,7 +2084,7 @@ async function refresh() {
       const mode=document.querySelector(`#mode-${side}`);
       if (mode && document.activeElement !== mode && s.command_mode) mode.value=s.command_mode;
       const params=s.control_parameters||{};
-      for (const [id,key] of [['kp','kp_nm_per_rad'],['kd','kd_nm_s_per_rad'],['ff','feedforward_torque_nm'],['limit','max_position_torque_nm'],['speed','target_max_velocity_rad_s']]) {
+      for (const [id,key] of [['kp','kp_nm_per_rad'],['kd','kd_nm_s_per_rad'],['ff','feedforward_torque_nm'],['speed-ff-limit','speed_feedforward_limit_nm'],['limit','max_position_torque_nm'],['speed','target_max_velocity_rad_s']]) {
         const input=document.querySelector(`#${id}-${side}`);
         if (input && document.activeElement !== input && params[key] !== undefined) input.value=Number(params[key]);
       }
@@ -2051,7 +2093,8 @@ async function refresh() {
         `命令模式: ${(s.command_mode||'--').toUpperCase()}  电机模式: ${s.control_mode_name||'--'} (${s.control_mode===undefined?'--':s.control_mode})\n`+
         `使能: ${s.enabled?'是':'否'}  服务已授权: ${s.armed?'是':'否'}  剩余: ${Number(s.lease_remaining_s||0).toFixed(1)} s\n`+
         `速度: ${s.velocity_rad_s===undefined?'--':s.velocity_rad_s.toFixed(3)} rad/s  目标: ${s.control_parameters?.target_max_velocity_rad_s===undefined?'--':Number(s.control_parameters.target_max_velocity_rad_s).toFixed(3)} rad/s\n`+
-        `速度前馈力矩: ${s.speed_feedforward_torque_nm===undefined?'--':s.speed_feedforward_torque_nm.toFixed(3)} Nm  实际力矩: ${s.torque_nm===undefined?'--':s.torque_nm.toFixed(3)} Nm\n`+
+        `速度前馈力矩: ${s.speed_feedforward_torque_nm===undefined?'--':s.speed_feedforward_torque_nm.toFixed(3)} Nm  合计前馈: ${s.control_parameters?.applied_feedforward_torque_nm===undefined?'--':Number(s.control_parameters.applied_feedforward_torque_nm).toFixed(3)} Nm\n`+
+        `实际力矩: ${s.torque_nm===undefined?'--':s.torque_nm.toFixed(3)} Nm\n`+
         `温度: ${s.motor_temp_c===undefined?'--':s.motor_temp_c.toFixed(1)} °C  状态: ${(s.status_flags||[]).join(', ')||'--'}\n`+
         `目标: ${s.target_position===undefined?'--':Number(s.target_position).toFixed(3)}  已应用: ${s.applied_target_position===undefined?'--':Number(s.applied_target_position).toFixed(3)}\n`+
         `${s.last_error||''}`;
