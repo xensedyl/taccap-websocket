@@ -55,6 +55,8 @@ def make_controller(*, reverse: bool = True):
     controller.speed_feedforward_limit_nm = 2.0
     controller.max_position_torque_nm = 0.25
     controller.speed_feedforward_torque_nm = 0.0
+    controller._target_motion_active = True
+    controller._target_motion_direction = 1.0
     return controller
 
 
@@ -99,11 +101,13 @@ def test_speed_feedforward_limit_is_symmetric_with_signed_base_bias() -> None:
     controller.speed_feedforward_limit_nm = 1.0
 
     controller.target_position = 0.0
+    controller._target_motion_direction = -1.0
     controller._advance_target_locked(10.01, actual_position=0.5)
     assert controller.speed_feedforward_torque_nm == 1.0
     assert controller.control_loop.gains[-1] == (8.0, 1.0, 2.0)
 
     controller.target_position = 1.0
+    controller._target_motion_direction = 1.0
     controller._advance_target_locked(10.02, actual_position=0.5)
     assert controller.speed_feedforward_torque_nm == -1.0
     assert controller.control_loop.gains[-1] == (8.0, 1.0, 0.0)
@@ -118,6 +122,34 @@ def test_speed_controller_stops_feedforward_at_target() -> None:
     assert controller.control_loop.targets[-1] == 1.0
     assert controller.control_loop.gains[-1] == (8.0, 1.0, 0.0)
     assert controller.speed_feedforward_torque_nm == 0.0
+    assert controller._target_motion_active is False
+
+
+def test_crossing_target_latches_position_hold_without_reversing() -> None:
+    controller = make_controller(reverse=True)
+    controller.target_position = 0.39
+    controller._target_motion_direction = -1.0
+
+    controller._advance_target_locked(10.01, actual_position=0.40)
+    assert controller._target_motion_active is True
+    assert controller.speed_feedforward_torque_nm == 0.6
+
+    # One feedback tick crosses the requested target. The final position is
+    # applied and velocity assistance is switched off permanently.
+    controller._advance_target_locked(10.02, actual_position=0.38)
+    assert controller._target_motion_active is False
+    assert controller.control_loop.targets[-1] == 0.39
+    assert controller.speed_feedforward_torque_nm == 0.0
+    assert controller.control_loop.gains[-1] == (8.0, 1.0, 0.0)
+
+    # Mechanical rebound/noise to the other side must not restart or reverse
+    # the speed feed-forward for the same request.
+    gain_count = len(controller.control_loop.gains)
+    controller._advance_target_locked(10.03, actual_position=0.41)
+    assert controller._target_motion_active is False
+    assert controller.control_loop.targets[-1] == 0.39
+    assert controller.speed_feedforward_torque_nm == 0.0
+    assert len(controller.control_loop.gains) == gain_count
 
 
 def test_zero_speed_keeps_position_only_behavior() -> None:

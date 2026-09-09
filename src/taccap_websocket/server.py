@@ -517,6 +517,12 @@ class GripperController:
         self.latest_status_updated_at_s: float | None = None
         self.applied_target_position: float | None = None
         self._target_update_monotonic = time.monotonic()
+        # A position request has two phases: one velocity-assisted approach,
+        # followed by a latched position hold.  The approach direction is
+        # fixed when a new target arrives so feedback noise cannot reverse the
+        # velocity feed-forward on alternate sides of the target.
+        self._target_motion_active = False
+        self._target_motion_direction = 0.0
         # The SDK ControlLoop accepts a position target but no velocity target.
         # Keep the velocity-derived torque contribution visible so the web UI
         # can distinguish the requested speed from the torque actually used to
@@ -578,6 +584,13 @@ class GripperController:
             "feedforward_torque_nm": ff,
             "max_position_torque_nm": self.max_position_torque_nm,
             "target_max_velocity_rad_s": self.target_max_velocity_rad_s,
+            "target_control_state": (
+                "moving"
+                if self._target_motion_active
+                else "holding"
+                if self.target_position is not None
+                else "idle"
+            ),
             "speed_feedforward_limit_nm": self.speed_feedforward_limit_nm,
             "speed_feedforward_torque_nm": self.speed_feedforward_torque_nm,
             "applied_feedforward_torque_nm": min(
@@ -776,48 +789,35 @@ class GripperController:
             loop is None
             or requested is None
             or cfg is None
+            or not self._target_motion_active
             or speed <= 0.0
             or actual_position is None
             or not math.isfinite(actual_position)
         ):
             speed_ff = 0.0
         else:
-            delta = requested - actual_position
-            # Do not continue driving once the requested normalized target is
-            # within one control tick of the measured position.
-            travel_rad = abs(float(cfg.max_open_rad) - float(cfg.min_open_rad))
-            close_window = SPEED_CONTROL_POSITION_TOLERANCE
-            if abs(delta) <= close_window:
-                speed_ff = 0.0
-            else:
-                _, kd, base_ff = self._control_gains()
-                # Reverse maps normalized opening direction to raw motor
-                # direction.  The feed-forward torque is sent in raw-radian
-                # coordinates, unlike the web target which is normalized.
-                raw_open_direction = -1.0 if int(cfg.flags) & 0x0002 else 1.0
-                raw_direction = raw_open_direction * math.copysign(1.0, delta)
-                # Firmware's MIT velocity feed-forward is not available
-                # through ControlLoop.  Add the algebraically equivalent
-                # torque bias kd*desired_raw_velocity, so
-                # tau = kp*error + kd*(desired_velocity-actual_velocity)
-                # while the one-tick position target remains a small tracking
-                # correction.
-                requested_speed_ff = raw_direction * min(
-                    self.speed_feedforward_limit_nm,
-                    abs(kd) * speed,
-                )
-                total_ff = min(
-                    MAX_DEBUG_FEEDFORWARD_TORQUE_NM,
-                    max(
-                        -MAX_DEBUG_FEEDFORWARD_TORQUE_NM,
-                        base_ff + requested_speed_ff,
-                    ),
-                )
-                # Report only the contribution that is actually left for
-                # speed after the signed base bias and total +/-2 Nm clamp.
-                # This guarantees |speed_ff| never exceeds the independently
-                # configured speed-feed-forward limit.
-                speed_ff = total_ff - base_ff
+            _, kd, base_ff = self._control_gains()
+            # Reverse maps normalized opening direction to raw motor
+            # direction. Use the direction captured for this motion instead
+            # of recomputing sign(target-actual) every tick: after arrival the
+            # phase is latched to HOLD, so noise or rebound cannot command a
+            # full-strength reversal.
+            raw_open_direction = -1.0 if int(cfg.flags) & 0x0002 else 1.0
+            raw_direction = raw_open_direction * self._target_motion_direction
+            requested_speed_ff = raw_direction * min(
+                self.speed_feedforward_limit_nm,
+                abs(kd) * speed,
+            )
+            total_ff = min(
+                MAX_DEBUG_FEEDFORWARD_TORQUE_NM,
+                max(
+                    -MAX_DEBUG_FEEDFORWARD_TORQUE_NM,
+                    base_ff + requested_speed_ff,
+                ),
+            )
+            # Report only the contribution that is actually left for speed
+            # after the signed base bias and total +/-2 Nm clamp.
+            speed_ff = total_ff - base_ff
 
         if abs(speed_ff - self.speed_feedforward_torque_nm) <= 1e-6:
             return
@@ -839,7 +839,12 @@ class GripperController:
             return
         now = time.monotonic() if now is None else now
         speed = self.target_max_velocity_rad_s
-        if speed > 0.0 and self.config is not None and actual_position is not None:
+        if (
+            self._target_motion_active
+            and speed > 0.0
+            and self.config is not None
+            and actual_position is not None
+        ):
             travel_rad = abs(float(self.config.max_open_rad) - float(self.config.min_open_rad))
             if travel_rad > 1e-6:
                 # A one-tick position look-ahead supplies a small proportional
@@ -848,16 +853,30 @@ class GripperController:
                 # an accumulated target getting far ahead of a loaded jaw.
                 lookahead = speed / CONTROL_LOOP_HZ / travel_rad
                 delta = requested - actual_position
-                if abs(delta) <= SPEED_CONTROL_POSITION_TOLERANCE:
+                reached = (
+                    abs(delta) <= SPEED_CONTROL_POSITION_TOLERANCE
+                    or self._target_motion_direction * delta <= 0.0
+                )
+                if reached:
+                    # Arrival (or a one-tick overshoot) permanently ends this
+                    # approach. Position impedance now owns the final target;
+                    # noise cannot restart speed control. Only a different
+                    # position request may start another approach.
+                    self._target_motion_active = False
+                    self._target_motion_direction = 0.0
                     applied = requested
                 else:
-                    applied = actual_position + math.copysign(
-                        min(abs(delta), lookahead),
-                        delta,
+                    applied = actual_position + self._target_motion_direction * min(
+                        abs(delta), lookahead
                     )
             else:
+                self._target_motion_active = False
+                self._target_motion_direction = 0.0
                 applied = requested
         else:
+            if speed <= 0.0:
+                self._target_motion_active = False
+                self._target_motion_direction = 0.0
             applied = requested
         applied = min(1.0, max(0.0, applied))
         if self.applied_target_position is None or abs(applied - self.applied_target_position) > 1e-7:
@@ -974,6 +993,8 @@ class GripperController:
             self._enable_grace_until = 0.0
             self.target_position = None
             self.applied_target_position = None
+            self._target_motion_active = False
+            self._target_motion_direction = 0.0
             self._target_update_monotonic = time.monotonic()
             self.last_error = None
             LOG.info(
@@ -1156,6 +1177,12 @@ class GripperController:
         with self.lock:
             gripper = self._require_gripper_locked()
             try:
+                # Enabling starts a fresh command session. Do not resume a
+                # stale approach target left over from before disable/watchdog.
+                self.target_position = None
+                self._target_motion_active = False
+                self._target_motion_direction = 0.0
+                self.speed_feedforward_torque_nm = 0.0
                 self._stop_control_loop_locked()
                 gripper.motor.clear_fault()
                 gripper.motor.enable()
@@ -1192,6 +1219,10 @@ class GripperController:
         with self.lock:
             gripper = self._require_gripper_locked()
             try:
+                self.target_position = None
+                self._target_motion_active = False
+                self._target_motion_direction = 0.0
+                self.speed_feedforward_torque_nm = 0.0
                 self._stop_control_loop_locked()
                 gripper.motor.disable()
                 self._start_control_loop_locked()
@@ -1239,20 +1270,44 @@ class GripperController:
                 # Current SDKs intentionally do not expose raw Motor
                 # submit_* / set_position methods to Python.  ControlLoop is
                 # the safe normalized [0,1] command surface for both modes.
-                self.target_position = position
                 observation = loop.observation()
+                actual_position = (
+                    float(observation.position) if observation.valid else None
+                )
+                target_changed = (
+                    self.target_position is None
+                    or abs(position - self.target_position) > 1e-7
+                )
+                self.target_position = position
+                if target_changed:
+                    delta = (
+                        position - actual_position
+                        if actual_position is not None
+                        else 0.0
+                    )
+                    self._target_motion_active = (
+                        self.target_max_velocity_rad_s > 0.0
+                        and actual_position is not None
+                        and abs(delta) > SPEED_CONTROL_POSITION_TOLERANCE
+                    )
+                    self._target_motion_direction = (
+                        math.copysign(1.0, delta)
+                        if self._target_motion_active
+                        else 0.0
+                    )
                 self._advance_target_locked(
                     time.monotonic(),
-                    actual_position=float(observation.position) if observation.valid else None,
+                    actual_position=actual_position,
                 )
                 self.last_lease = time.monotonic()
                 self.last_error = None
                 LOG.info(
-                    "%s target position=%.3f applied=%.3f mode=%s",
+                    "%s target position=%.3f applied=%.3f mode=%s state=%s",
                     self.spec.side,
                     position,
                     self.applied_target_position,
                     self.control_mode,
+                    "moving" if self._target_motion_active else "holding",
                 )
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"
@@ -1264,6 +1319,10 @@ class GripperController:
             if not self.armed or now - self.last_lease <= LEASE_TIMEOUT_S:
                 return
             try:
+                self.target_position = None
+                self._target_motion_active = False
+                self._target_motion_direction = 0.0
+                self.speed_feedforward_torque_nm = 0.0
                 if self.gripper is not None:
                     self._stop_control_loop_locked()
                     self.gripper.motor.disable()
@@ -1292,6 +1351,13 @@ class GripperController:
                 value["target_position"] = self.target_position
                 value["command_mode"] = self.control_mode
                 value["applied_target_position"] = self.applied_target_position
+                value["target_control_state"] = (
+                    "moving"
+                    if self._target_motion_active
+                    else "holding"
+                    if self.target_position is not None
+                    else "idle"
+                )
                 value["speed_feedforward_torque_nm"] = self.speed_feedforward_torque_nm
                 value["control_parameters"] = self._control_parameters_locked()
                 value["mit_gains"] = dict(self._mode_gains[CONTROL_MODE_MIT])
@@ -2096,7 +2162,7 @@ async function refresh() {
         `速度前馈力矩: ${s.speed_feedforward_torque_nm===undefined?'--':s.speed_feedforward_torque_nm.toFixed(3)} Nm  合计前馈: ${s.control_parameters?.applied_feedforward_torque_nm===undefined?'--':Number(s.control_parameters.applied_feedforward_torque_nm).toFixed(3)} Nm\n`+
         `实际力矩: ${s.torque_nm===undefined?'--':s.torque_nm.toFixed(3)} Nm\n`+
         `温度: ${s.motor_temp_c===undefined?'--':s.motor_temp_c.toFixed(1)} °C  状态: ${(s.status_flags||[]).join(', ')||'--'}\n`+
-        `目标: ${s.target_position===undefined?'--':Number(s.target_position).toFixed(3)}  已应用: ${s.applied_target_position===undefined?'--':Number(s.applied_target_position).toFixed(3)}\n`+
+        `目标: ${s.target_position===undefined?'--':Number(s.target_position).toFixed(3)}  已应用: ${s.applied_target_position===undefined?'--':Number(s.applied_target_position).toFixed(3)}  状态: ${s.target_control_state||'--'}\n`+
         `${s.last_error||''}`;
     }
   } catch(e) { console.error(e); }
