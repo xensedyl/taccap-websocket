@@ -59,6 +59,18 @@ MIT_FEEDFORWARD_TORQUE_NM = _configured_float("TACCAP_MIT_FEEDFORWARD_TORQUE", 0
 POSITION_KP_NM_PER_RAD = _configured_float("TACCAP_POSITION_KP", 8.0)
 POSITION_KD_NM_S_PER_RAD = _configured_float("TACCAP_POSITION_KD", 1.0)
 CONTROL_LOOP_HZ = 100
+MOTOR_STREAM_HZ = 100
+# Optional host-side target slew limit.  The SDK ControlLoop accepts a
+# normalized target, not a velocity argument; the bridge advances that target
+# at the requested raw-radian speed before handing it to ControlLoop.
+DEFAULT_TARGET_MAX_VELOCITY_RAD_S = _configured_float(
+    "TACCAP_TARGET_MAX_VELOCITY_RAD_S", 0.0
+)
+MAX_TARGET_MAX_VELOCITY_RAD_S = 2.0
+MAX_DEBUG_KP_NM_PER_RAD = 100.0
+MAX_DEBUG_KD_NM_S_PER_RAD = 50.0
+MAX_DEBUG_FEEDFORWARD_TORQUE_NM = 2.0
+MAX_DEBUG_POSITION_TORQUE_NM = 2.0
 
 MOTOR_MODE_NAMES = {
     0: "idle",
@@ -466,6 +478,22 @@ class GripperController:
                 "TACCAP_GRIPPER_CONTROL_MODE", CONTROL_MODE_POSITION
             )
         self.control_mode = self._validate_control_mode(control_mode)
+        self._mode_gains: dict[str, dict[str, float]] = {
+            CONTROL_MODE_POSITION: {
+                "kp_nm_per_rad": POSITION_KP_NM_PER_RAD,
+                "kd_nm_s_per_rad": POSITION_KD_NM_S_PER_RAD,
+                "feedforward_torque_nm": 0.0,
+            },
+            CONTROL_MODE_MIT: {
+                "kp_nm_per_rad": MIT_KP_NM_PER_RAD,
+                "kd_nm_s_per_rad": MIT_KD_NM_S_PER_RAD,
+                "feedforward_torque_nm": MIT_FEEDFORWARD_TORQUE_NM,
+            },
+        }
+        self.max_position_torque_nm = MAX_TORQUE_NM
+        self.target_max_velocity_rad_s = DEFAULT_TARGET_MAX_VELOCITY_RAD_S
+        # Default SDK limits are intentionally kept separate from the old
+        # position-command constants; this is the constructor safety clamp.
         self.last_connect_attempt = 0.0
         self.status_condition = threading.Condition()
         self.latest_status: dict[str, Any] | None = None
@@ -473,6 +501,8 @@ class GripperController:
         # exported on the status stream so remote clients can distinguish a
         # stale `.4` cache from transport delay on the way to the client.
         self.latest_status_updated_at_s: float | None = None
+        self.applied_target_position: float | None = None
+        self._target_update_monotonic = time.monotonic()
         self.status_sequence = 0
         self.status_stop = threading.Event()
         self.status_thread: threading.Thread | None = None
@@ -511,13 +541,146 @@ class GripperController:
 
     def _control_gains(self, mode: str | None = None) -> tuple[float, float, float]:
         selected = mode or self.control_mode
-        if selected == CONTROL_MODE_MIT:
-            return (
-                MIT_KP_NM_PER_RAD,
-                MIT_KD_NM_S_PER_RAD,
-                MIT_FEEDFORWARD_TORQUE_NM,
+        values = self._mode_gains[selected]
+        return (
+            values["kp_nm_per_rad"],
+            values["kd_nm_s_per_rad"],
+            values["feedforward_torque_nm"],
+        )
+
+    def _control_parameters_locked(self, mode: str | None = None) -> dict[str, Any]:
+        selected = mode or self.control_mode
+        kp, kd, ff = self._control_gains(selected)
+        return {
+            "mode": selected,
+            "kp_nm_per_rad": kp,
+            "kd_nm_s_per_rad": kd,
+            "feedforward_torque_nm": ff,
+            "max_position_torque_nm": self.max_position_torque_nm,
+            "target_max_velocity_rad_s": self.target_max_velocity_rad_s,
+            "control_loop_hz": CONTROL_LOOP_HZ,
+            "motor_stream_hz": MOTOR_STREAM_HZ,
+            "submit_phase": "STREAM_LOCKED",
+            "limits": {
+                "kp_nm_per_rad": [0.0, MAX_DEBUG_KP_NM_PER_RAD],
+                "kd_nm_s_per_rad": [0.0, MAX_DEBUG_KD_NM_S_PER_RAD],
+                "feedforward_torque_nm": [
+                    -MAX_DEBUG_FEEDFORWARD_TORQUE_NM,
+                    MAX_DEBUG_FEEDFORWARD_TORQUE_NM,
+                ],
+                "max_position_torque_nm": [0.0, MAX_DEBUG_POSITION_TORQUE_NM],
+                "target_max_velocity_rad_s": [0.0, MAX_TARGET_MAX_VELOCITY_RAD_S],
+            },
+        }
+
+    @staticmethod
+    def _parameter_float(body: dict[str, Any], *names: str) -> float | None:
+        for name in names:
+            if name in body:
+                value = body[name]
+                if isinstance(value, bool):
+                    raise ApiError(HTTPStatus.BAD_REQUEST, f"{name} must be numeric")
+                try:
+                    parsed = float(value)
+                except (TypeError, ValueError) as exc:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, f"{name} must be numeric") from exc
+                if not math.isfinite(parsed):
+                    raise ApiError(HTTPStatus.BAD_REQUEST, f"{name} must be finite")
+                return parsed
+        return None
+
+    def set_control_parameters(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Update debug gains and host-side target speed for one mode.
+
+        The native SDK exposes gains through ``ControlLoop.set_gains`` only;
+        safety limits that belong to the constructor are applied by rebuilding
+        the loop while holding the controller lock.  The endpoint never
+        exposes an unbounded raw motor command.
+        """
+
+        mode_value = body.get("mode", body.get("control_mode", self.control_mode))
+        if not isinstance(mode_value, str):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "mode must be one of: position, mit")
+        mode = self._validate_control_mode(mode_value)
+        updates = {
+            "kp_nm_per_rad": self._parameter_float(body, "kp_nm_per_rad", "kp"),
+            "kd_nm_s_per_rad": self._parameter_float(body, "kd_nm_s_per_rad", "kd"),
+            "feedforward_torque_nm": self._parameter_float(
+                body, "feedforward_torque_nm", "feedforward_torque", "ff"
+            ),
+        }
+        max_position_torque = self._parameter_float(
+            body, "max_position_torque_nm", "position_torque_limit_nm"
+        )
+        target_velocity = self._parameter_float(
+            body,
+            "target_max_velocity_rad_s",
+            "max_velocity_rad_s",
+            "velocity_rad_s",
+        )
+        for name, value in updates.items():
+            if value is None:
+                continue
+            upper = {
+                "kp_nm_per_rad": MAX_DEBUG_KP_NM_PER_RAD,
+                "kd_nm_s_per_rad": MAX_DEBUG_KD_NM_S_PER_RAD,
+                "feedforward_torque_nm": MAX_DEBUG_FEEDFORWARD_TORQUE_NM,
+            }[name]
+            if value < (-upper if name == "feedforward_torque_nm" else 0.0) or value > upper:
+                raise ApiError(HTTPStatus.BAD_REQUEST, f"{name} must be within its safety range")
+        if max_position_torque is not None and not 0.0 <= max_position_torque <= MAX_DEBUG_POSITION_TORQUE_NM:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "max_position_torque_nm is outside the safety range")
+        if target_velocity is not None and not 0.0 <= target_velocity <= MAX_TARGET_MAX_VELOCITY_RAD_S:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "target_max_velocity_rad_s is outside the safety range")
+
+        with self.lock:
+            previous_mode = self.control_mode
+            self.control_mode = mode
+            for name, value in updates.items():
+                if value is not None:
+                    self._mode_gains[mode][name] = value
+            if target_velocity is not None:
+                self.target_max_velocity_rad_s = target_velocity
+            rebuild = (
+                max_position_torque is not None
+                and max_position_torque != self.max_position_torque_nm
             )
-        return POSITION_KP_NM_PER_RAD, POSITION_KD_NM_S_PER_RAD, 0.0
+            if max_position_torque is not None:
+                self.max_position_torque_nm = max_position_torque
+            if rebuild and self.control_loop is not None:
+                self._rebuild_control_loop_locked()
+            else:
+                self._apply_control_gains_locked()
+            if previous_mode != mode:
+                LOG.info(
+                    "%s gripper command mode changed by tuning request: %s -> %s",
+                    self.spec.side,
+                    previous_mode,
+                    mode,
+                )
+            return self._control_parameters_locked(mode)
+
+    def _rebuild_control_loop_locked(self) -> None:
+        old_loop = self.control_loop
+        if old_loop is None or self.gripper is None:
+            return
+        was_running = bool(old_loop.running)
+        if was_running:
+            old_loop.stop()
+        kp, kd, ff = self._control_gains()
+        self.control_loop = self.taccap.ControlLoop(
+            self.gripper,
+            hz=CONTROL_LOOP_HZ,
+            kp=kp,
+            kd=kd,
+            feedforward_torque=ff,
+            motor_stream_hz=MOTOR_STREAM_HZ,
+            max_position_torque_nm=self.max_position_torque_nm,
+        )
+        if was_running:
+            self.control_loop.start()
+            if self.applied_target_position is not None:
+                self.control_loop.set_target(self.applied_target_position)
 
     def _apply_control_gains_locked(self) -> None:
         if self.control_loop is None:
@@ -525,11 +688,43 @@ class GripperController:
         kp, kd, ff = self._control_gains()
         self.control_loop.set_gains(kp, kd, ff)
 
+    def _advance_target_locked(self, now: float | None = None) -> None:
+        """Apply the requested target, optionally respecting a raw-rad/s slew limit."""
+
+        loop = self.control_loop
+        requested = self.target_position
+        if loop is None or requested is None:
+            return
+        now = time.monotonic() if now is None else now
+        previous = self.applied_target_position
+        if previous is None:
+            previous = requested
+        elapsed = max(0.0, now - self._target_update_monotonic)
+        speed = self.target_max_velocity_rad_s
+        if speed > 0.0 and self.config is not None:
+            travel_rad = abs(float(self.config.max_open_rad) - float(self.config.min_open_rad))
+            if travel_rad > 1e-6:
+                max_step = speed * elapsed / travel_rad
+                delta = requested - previous
+                if abs(delta) > max_step:
+                    previous += math.copysign(max_step, delta)
+                else:
+                    previous = requested
+        else:
+            previous = requested
+        previous = min(1.0, max(0.0, previous))
+        if self.applied_target_position is None or abs(previous - self.applied_target_position) > 1e-7:
+            loop.set_target(previous)
+            self.applied_target_position = previous
+        self._target_update_monotonic = now
+
     def _start_control_loop_locked(self) -> None:
         if self.control_loop is None or self.control_loop.running:
             return
         self._apply_control_gains_locked()
         self.control_loop.start()
+        self.applied_target_position = float(self.control_loop.target)
+        self._target_update_monotonic = time.monotonic()
 
     def _stop_control_loop_locked(self) -> None:
         if self.control_loop is None or not self.control_loop.running:
@@ -617,14 +812,19 @@ class GripperController:
                 kp=kp,
                 kd=kd,
                 feedforward_torque=ff,
-                max_position_torque_nm=MAX_TORQUE_NM,
+                motor_stream_hz=MOTOR_STREAM_HZ,
+                max_position_torque_nm=self.max_position_torque_nm,
             )
             # The current SDK's ControlLoop owns the motor-status stream and
             # is the only Python-safe path for MIT/position commands.
             self.control_loop.start()
+            self.applied_target_position = float(self.control_loop.target)
+            self._target_update_monotonic = time.monotonic()
             self.armed = False
             self._enable_grace_until = 0.0
             self.target_position = None
+            self.applied_target_position = None
+            self._target_update_monotonic = time.monotonic()
             self.last_error = None
             LOG.info(
                 "%s gripper connected: serial=%s config=%r",
@@ -695,6 +895,7 @@ class GripperController:
                         loop = self.control_loop
                         if loop is None or not loop.running:
                             raise RuntimeError("TacCap ControlLoop is not running")
+                        self._advance_target_locked()
                         observation = loop.observation()
                         if not observation.valid:
                             raise RuntimeError("waiting for TacCap motor-status stream")
@@ -740,11 +941,9 @@ class GripperController:
                             "control_mode": 4,
                             "control_mode_name": MOTOR_MODE_NAMES[4],
                             "command_mode": self.control_mode,
-                            "mit_gains": {
-                                "kp_nm_per_rad": MIT_KP_NM_PER_RAD,
-                                "kd_nm_s_per_rad": MIT_KD_NM_S_PER_RAD,
-                                "feedforward_torque_nm": MIT_FEEDFORWARD_TORQUE_NM,
-                            },
+                            "control_parameters": self._control_parameters_locked(),
+                            # Compatibility field retained for older clients.
+                            "mit_gains": dict(self._mode_gains[CONTROL_MODE_MIT]),
                             "config": {
                                 "flags": int(cfg.flags),
                                 "max_open_rad": float(cfg.max_open_rad),
@@ -883,14 +1082,15 @@ class GripperController:
                 # Current SDKs intentionally do not expose raw Motor
                 # submit_* / set_position methods to Python.  ControlLoop is
                 # the safe normalized [0,1] command surface for both modes.
-                loop.set_target(position)
                 self.target_position = position
+                self._advance_target_locked(time.monotonic())
                 self.last_lease = time.monotonic()
                 self.last_error = None
                 LOG.info(
-                    "%s target position=%.3f mode=%s",
+                    "%s target position=%.3f applied=%.3f mode=%s",
                     self.spec.side,
                     position,
+                    self.applied_target_position,
                     self.control_mode,
                 )
             except Exception as exc:
@@ -930,11 +1130,9 @@ class GripperController:
                 value["armed"] = self.armed
                 value["target_position"] = self.target_position
                 value["command_mode"] = self.control_mode
-                value["mit_gains"] = {
-                    "kp_nm_per_rad": MIT_KP_NM_PER_RAD,
-                    "kd_nm_s_per_rad": MIT_KD_NM_S_PER_RAD,
-                    "feedforward_torque_nm": MIT_FEEDFORWARD_TORQUE_NM,
-                }
+                value["applied_target_position"] = self.applied_target_position
+                value["control_parameters"] = self._control_parameters_locked()
+                value["mit_gains"] = dict(self._mode_gains[CONTROL_MODE_MIT])
                 value["lease_remaining_s"] = round(
                     max(0.0, LEASE_TIMEOUT_S - (time.monotonic() - self.last_lease))
                     if self.armed
@@ -962,11 +1160,8 @@ class GripperController:
             "enabled": False,
             "lease_remaining_s": 0.0,
             "command_mode": self.control_mode,
-            "mit_gains": {
-                "kp_nm_per_rad": MIT_KP_NM_PER_RAD,
-                "kd_nm_s_per_rad": MIT_KD_NM_S_PER_RAD,
-                "feedforward_torque_nm": MIT_FEEDFORWARD_TORQUE_NM,
-            },
+            "control_parameters": self._control_parameters_locked(),
+            "mit_gains": dict(self._mode_gains[CONTROL_MODE_MIT]),
             "last_error": error,
         }
 
@@ -1647,6 +1842,10 @@ h1 { margin: 0 0 8px; } .hint { color:#aeb9ca; margin-bottom:18px; }
 .card { background:#19212d; border:1px solid #303b4b; border-radius:12px; padding:14px; }
 .camera img { display:block; width:100%; aspect-ratio:4/3; object-fit:contain; background:#05070a; border-radius:8px; }
 .row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:10px 0; }
+.tuning { display:grid; grid-template-columns:repeat(2,minmax(120px,1fr)); gap:7px; margin:10px 0; }
+.tuning label { display:flex; flex-direction:column; gap:3px; color:#aeb9ca; font-size:12px; }
+.tuning input { min-width:0; width:100%; box-sizing:border-box; }
+.tune { background:#d5a84c; color:#17130a; }
 button { border:0; border-radius:7px; padding:9px 13px; cursor:pointer; font-weight:650; }
 .enable { background:#48bd79; } .disable { background:#8893a3; }
 .open { background:#55a9f3; } .close { background:#f06c64; }
@@ -1684,6 +1883,15 @@ function controlCard(side) {
     </div>
     <div class="row"><span>位置</span><input id="slider-${side}" type="range" min="0" max="1" step="0.01" value="1">
       <output id="value-${side}">1.00</output><button onclick="sendSlider('${side}')">发送</button></div>
+    <div class="tuning" title="新版 SDK 的 position 和 mit 都通过 ControlLoop 发送阻抗帧">
+      <label>kp (Nm/rad)<input id="kp-${side}" type="number" min="0" max="100" step="0.1"></label>
+      <label>kd (Nm·s/rad)<input id="kd-${side}" type="number" min="0" max="50" step="0.1"></label>
+      <label>前馈力矩 (Nm)<input id="ff-${side}" type="number" min="-2" max="2" step="0.01"></label>
+      <label>位置误差力矩上限 (Nm)<input id="limit-${side}" type="number" min="0" max="2" step="0.01"></label>
+      <label>目标速度 (rad/s)<input id="speed-${side}" type="number" min="0" max="2" step="0.01"></label>
+      <label>状态流频率 (Hz)<input value="100" disabled></label>
+    </div>
+    <div class="row"><button class="tune" onclick="applyTuning('${side}')">应用调参</button><small>速度为主机目标斜坡限制；0=关闭</small></div>
     <div class="status" id="status-${side}">读取中…</div></article>`;
 }
 document.querySelector('#controls').innerHTML = controlCard('left') + controlCard('right');
@@ -1695,6 +1903,12 @@ async function enableSide(side) { try { await api(`/api/grippers/${side}/enable`
 async function disableSide(side) { try { await api(`/api/grippers/${side}/disable`,{method:'POST',body:'{}'}); armed[side]=false; await refresh(); } catch(e){alert(e.message);} }
 async function changeMode(side, mode) { try { await api(`/api/grippers/${side}/control_mode`,{method:'POST',body:JSON.stringify({mode})}); await refresh(); } catch(e){alert(e.message); await refresh();} }
 async function moveSide(side, position, confirm_close) { try { await api(`/api/grippers/${side}/position`,{method:'POST',body:JSON.stringify({position,confirm_close})}); await refresh(); } catch(e){alert(e.message);} }
+async function applyTuning(side) {
+  const n=id=>Number(document.querySelector(`#${id}-${side}`).value);
+  const body={mode:document.querySelector(`#mode-${side}`).value,kp_nm_per_rad:n('kp'),kd_nm_s_per_rad:n('kd'),feedforward_torque_nm:n('ff'),max_position_torque_nm:n('limit'),target_max_velocity_rad_s:n('speed')};
+  try { await api(`/api/grippers/${side}/control_parameters`,{method:'POST',body:JSON.stringify(body)}); await refresh(); }
+  catch(e) { alert(e.message); }
+}
 function sendSlider(side) { const p=Number(document.querySelector(`#slider-${side}`).value); moveSide(side,p,p<=0.05); }
 async function refresh() {
   try {
@@ -1705,12 +1919,18 @@ async function refresh() {
       const cls=s.available?'ok':'bad';
       const mode=document.querySelector(`#mode-${side}`);
       if (mode && document.activeElement !== mode && s.command_mode) mode.value=s.command_mode;
+      const params=s.control_parameters||{};
+      for (const [id,key] of [['kp','kp_nm_per_rad'],['kd','kd_nm_s_per_rad'],['ff','feedforward_torque_nm'],['limit','max_position_torque_nm'],['speed','target_max_velocity_rad_s']]) {
+        const input=document.querySelector(`#${id}-${side}`);
+        if (input && document.activeElement !== input && params[key] !== undefined) input.value=Number(params[key]);
+      }
       document.querySelector(`#status-${side}`).innerHTML=`<span class="${cls}">${s.available?'在线':'不可用'}</span>\n`+
         `位置: ${s.position===undefined?'--':s.position.toFixed(3)}  原始: ${s.raw_position_rad===undefined?'--':s.raw_position_rad.toFixed(4)} rad\n`+
         `命令模式: ${(s.command_mode||'--').toUpperCase()}  电机模式: ${s.control_mode_name||'--'} (${s.control_mode===undefined?'--':s.control_mode})\n`+
         `使能: ${s.enabled?'是':'否'}  服务已授权: ${s.armed?'是':'否'}  剩余: ${Number(s.lease_remaining_s||0).toFixed(1)} s\n`+
         `速度: ${s.velocity_rad_s===undefined?'--':s.velocity_rad_s.toFixed(3)} rad/s  力矩: ${s.torque_nm===undefined?'--':s.torque_nm.toFixed(3)} Nm\n`+
         `温度: ${s.motor_temp_c===undefined?'--':s.motor_temp_c.toFixed(1)} °C  状态: ${(s.status_flags||[]).join(', ')||'--'}\n`+
+        `目标: ${s.target_position===undefined?'--':Number(s.target_position).toFixed(3)}  已应用: ${s.applied_target_position===undefined?'--':Number(s.applied_target_position).toFixed(3)}\n`+
         `${s.last_error||''}`;
     }
   } catch(e) { console.error(e); }
@@ -1916,6 +2136,13 @@ def make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     if side in state.grippers:
                         self._gripper_status_stream(side)
                         return
+                if path.startswith("/api/grippers/") and path.endswith("/control_parameters"):
+                    side = path[len("/api/grippers/") : -len("/control_parameters")].strip("/")
+                    if side in state.grippers:
+                        controller = state.grippers[side]
+                        with controller.lock:
+                            self._json(HTTPStatus.OK, controller._control_parameters_locked())
+                        return
                 if path == "/api/grippers":
                     self._json(
                         HTTPStatus.OK,
@@ -2092,6 +2319,8 @@ def make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                             "mode must be one of: position, mit",
                         )
                     result = controller.set_control_mode(mode)
+                elif action in {"control_parameters", "parameters", "tuning"}:
+                    result = controller.set_control_parameters(body)
                 elif action == "position":
                     if "position" not in body:
                         raise ApiError(HTTPStatus.BAD_REQUEST, "missing position")

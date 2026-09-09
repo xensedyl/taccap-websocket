@@ -227,6 +227,27 @@ TACCAP_RIGHT_GRIPPER_CONTROL_MODE=position
 服务状态中的 `command_mode` 表示当前选中的增益组；当前 SDK 的安全控制器实际
 发送的是 MIT impedance 帧，`control_mode_name` 会显示 `impedance (MIT)`。
 
+调试时可以通过 Web 页面每个夹爪卡片中的“应用调参”修改当前或指定模式的
+`kp`、`kd`、前馈力矩、位置误差力矩上限和目标速度。也可以直接调用 REST API：
+
+```bash
+# 查询当前参数和安全范围
+curl http://10.192.1.4:8765/api/grippers/left/control_parameters
+
+# 修改左夹爪 MIT 参数（立即作用于运行中的 ControlLoop）
+curl -X POST http://10.192.1.4:8765/api/grippers/left/control_parameters \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"mit","kp_nm_per_rad":12,"kd_nm_s_per_rad":1.5,
+       "feedforward_torque_nm":0,"max_position_torque_nm":0.25,
+       "target_max_velocity_rad_s":0.6}'
+```
+
+参数有服务端安全上限，当前分别是 `kp≤100`、`kd≤50`、前馈力矩绝对值
+`≤2 Nm`、位置误差力矩上限 `≤2 Nm`、目标速度 `≤2 rad/s`。目标速度是桥接层
+对归一化目标施加的斜坡限制；设为 `0` 表示不限制。新版 SDK 的
+`STREAM_LOCKED` 模式下，控制循环频率和电机状态流固定为 100 Hz，不能通过
+旧的 `max_velocity` 参数直接改变电机固件速度。
+
 日志统一保存到目标机项目的 `.log/`，文件名包含日期、时间和进程号，例如：
 
 ```text
