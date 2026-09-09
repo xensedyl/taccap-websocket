@@ -56,6 +56,9 @@ def _configured_float(name: str, default: float) -> float:
 MIT_KP_NM_PER_RAD = _configured_float("TACCAP_MIT_KP", 8.0)
 MIT_KD_NM_S_PER_RAD = _configured_float("TACCAP_MIT_KD", 1.0)
 MIT_FEEDFORWARD_TORQUE_NM = _configured_float("TACCAP_MIT_FEEDFORWARD_TORQUE", 0.0)
+POSITION_KP_NM_PER_RAD = _configured_float("TACCAP_POSITION_KP", 8.0)
+POSITION_KD_NM_S_PER_RAD = _configured_float("TACCAP_POSITION_KD", 1.0)
+CONTROL_LOOP_HZ = 100
 
 MOTOR_MODE_NAMES = {
     0: "idle",
@@ -446,6 +449,7 @@ class GripperController:
         self.lock = threading.RLock()
         self.gripper: Any | None = None
         self.config: Any | None = None
+        self.control_loop: Any | None = None
         self.armed = False
         self.last_lease = 0.0
         # Firmware may return the pre-enable status for a short interval after
@@ -486,16 +490,17 @@ class GripperController:
     def set_control_mode(self, mode: str) -> dict[str, Any]:
         """Select the command primitive used by subsequent position requests.
 
-        ``mit`` sends the SDK's no-ACK impedance frame with the configured
-        gains.  It is deliberately a command-mode selection, not a persistent
-        change to the motor's CAN protocol; the firmware status reports mode 4
-        after the first MIT command is applied.
+        Current TacCap SDKs intentionally remove raw motor ``submit_*`` and
+        ``set_position`` methods from Python.  Both web modes therefore use
+        the SDK ``ControlLoop``; ``position`` selects conservative gains and
+        ``mit`` selects the configured impedance gains.
         """
 
         mode = self._validate_control_mode(mode)
         with self.lock:
             previous = self.control_mode
             self.control_mode = mode
+            self._apply_control_gains_locked()
             LOG.info(
                 "%s gripper command mode changed: %s -> %s",
                 self.spec.side,
@@ -504,15 +509,44 @@ class GripperController:
             )
         return self.status()
 
+    def _control_gains(self, mode: str | None = None) -> tuple[float, float, float]:
+        selected = mode or self.control_mode
+        if selected == CONTROL_MODE_MIT:
+            return (
+                MIT_KP_NM_PER_RAD,
+                MIT_KD_NM_S_PER_RAD,
+                MIT_FEEDFORWARD_TORQUE_NM,
+            )
+        return POSITION_KP_NM_PER_RAD, POSITION_KD_NM_PER_RAD, 0.0
+
+    def _apply_control_gains_locked(self) -> None:
+        if self.control_loop is None:
+            return
+        kp, kd, ff = self._control_gains()
+        self.control_loop.set_gains(kp, kd, ff)
+
+    def _start_control_loop_locked(self) -> None:
+        if self.control_loop is None or self.control_loop.running:
+            return
+        self._apply_control_gains_locked()
+        self.control_loop.start()
+
+    def _stop_control_loop_locked(self) -> None:
+        if self.control_loop is None or not self.control_loop.running:
+            return
+        self.control_loop.stop()
+
     def _stop_transport_locked(self) -> None:
         if self.gripper is None:
             return
+        self._stop_control_loop_locked()
         try:
             self.gripper.transport.stop()
         except Exception:
             LOG.exception("%s transport stop failed", self.spec.side)
         self.gripper = None
         self.config = None
+        self.control_loop = None
         self.armed = False
 
     @staticmethod
@@ -539,8 +573,10 @@ class GripperController:
         self.armed = False
         self.last_lease = 0.0
         old_gripper = self.gripper
+        self._stop_control_loop_locked()
         self.gripper = None
         self.config = None
+        self.control_loop = None
         self.last_connect_attempt = time.monotonic()
         if old_gripper is not None:
             try:
@@ -574,6 +610,18 @@ class GripperController:
             gripper.motor.disable()
             self.gripper = gripper
             self.config = config
+            kp, kd, ff = self._control_gains()
+            self.control_loop = self.taccap.ControlLoop(
+                gripper,
+                hz=CONTROL_LOOP_HZ,
+                kp=kp,
+                kd=kd,
+                feedforward_torque=ff,
+                max_position_torque_nm=MAX_TORQUE_NM,
+            )
+            # The current SDK's ControlLoop owns the motor-status stream and
+            # is the only Python-safe path for MIT/position commands.
+            self.control_loop.start()
             self.armed = False
             self._enable_grace_until = 0.0
             self.target_position = None
@@ -595,6 +643,7 @@ class GripperController:
                 pass
             self.gripper = None
             self.config = None
+            self.control_loop = None
             self.armed = False
             return False
 
@@ -643,8 +692,13 @@ class GripperController:
                         # adapter settles; status() will report the last error.
                         pass
                     else:
-                        sample = gripper.motor.read_status(500)
-                        raw_status = int(sample.status)
+                        loop = self.control_loop
+                        if loop is None or not loop.running:
+                            raise RuntimeError("TacCap ControlLoop is not running")
+                        observation = loop.observation()
+                        if not observation.valid:
+                            raise RuntimeError("waiting for TacCap motor-status stream")
+                        raw_status = int(observation.status)
                         hardware_enabled = bool(raw_status & 0x0001)
                         if (
                             self.armed
@@ -653,7 +707,7 @@ class GripperController:
                         ):
                             self.armed = False
                             self.last_lease = 0.0
-                        normalized = min(1.0, max(0.0, float(gripper.rad_to_pos(float(sample.actual_pos)))))
+                        normalized = min(1.0, max(0.0, float(observation.position)))
                         cfg = self.config
                         remaining = (
                             max(0.0, LEASE_TIMEOUT_S - (time.monotonic() - self.last_lease))
@@ -670,20 +724,21 @@ class GripperController:
                             "enabled": hardware_enabled,
                             "lease_remaining_s": round(remaining, 3),
                             "position": normalized,
-                            "raw_position_rad": float(sample.actual_pos),
-                            "velocity_rad_s": float(sample.actual_vel),
-                            "torque_nm": float(sample.actual_torque),
-                            "motor_temp_c": float(sample.motor_temp_c),
+                            "raw_position_rad": float(observation.raw_pos),
+                            "velocity_rad_s": float(observation.velocity),
+                            "torque_nm": float(observation.torque),
+                            "motor_temp_c": float(observation.motor_temp_c),
                             "status": raw_status,
                             "status_flags": [
                                 name for bit, name in MOTOR_STATUS_BITS.items() if raw_status & bit
                             ],
                             "target_position": self.target_position,
-                            "firmware_target_rad": float(sample.target_pos),
-                            "control_mode": int(sample.control_mode),
-                            "control_mode_name": MOTOR_MODE_NAMES.get(
-                                int(sample.control_mode), "unknown"
-                            ),
+                            # ControlLoop owns the command frame and the
+                            # current observation type does not expose the
+                            # firmware target/control-mode fields.
+                            "firmware_target_rad": None,
+                            "control_mode": 4,
+                            "control_mode_name": MOTOR_MODE_NAMES[4],
                             "command_mode": self.control_mode,
                             "mit_gains": {
                                 "kp_nm_per_rad": MIT_KP_NM_PER_RAD,
@@ -745,8 +800,10 @@ class GripperController:
         with self.lock:
             gripper = self._require_gripper_locked()
             try:
+                self._stop_control_loop_locked()
                 gripper.motor.clear_fault()
                 gripper.motor.enable()
+                self._start_control_loop_locked()
                 self.armed = True
                 self.last_lease = time.monotonic()
                 self._enable_grace_until = self.last_lease + 0.75
@@ -754,8 +811,10 @@ class GripperController:
             except Exception as exc:
                 if self._is_serial_error(exc) and self._reconnect_after_serial_error_locked(exc):
                     try:
+                        self._stop_control_loop_locked()
                         self.gripper.motor.clear_fault()
                         self.gripper.motor.enable()
+                        self._start_control_loop_locked()
                         self.armed = True
                         self.last_lease = time.monotonic()
                         self._enable_grace_until = self.last_lease + 0.75
@@ -766,6 +825,10 @@ class GripperController:
                 self.armed = False
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 self._enable_grace_until = 0.0
+                try:
+                    self._start_control_loop_locked()
+                except Exception:
+                    LOG.exception("%s could not restart control loop after enable failure", self.spec.side)
                 raise ApiError(HTTPStatus.CONFLICT, self.last_error) from exc
         return self.status()
 
@@ -773,7 +836,9 @@ class GripperController:
         with self.lock:
             gripper = self._require_gripper_locked()
             try:
+                self._stop_control_loop_locked()
                 gripper.motor.disable()
+                self._start_control_loop_locked()
                 LOG.info("%s gripper disabled (%s)", self.spec.side, reason)
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"
@@ -811,32 +876,21 @@ class GripperController:
                     f"enable the {self.spec.side} gripper before commanding it",
                 )
             try:
-                target_rad = float(gripper.pos_to_rad(position))
-                if self.control_mode == CONTROL_MODE_MIT:
-                    # TacCap's MIT force-position primitive is an impedance
-                    # frame.  The no-ACK path avoids serial round trips in a
-                    # realtime remote control loop; the status reader remains
-                    # responsible for health/feedback polling.
-                    gripper.motor.submit_impedance(
-                        target_rad,
-                        MIT_KP_NM_PER_RAD,
-                        MIT_KD_NM_S_PER_RAD,
-                        MIT_FEEDFORWARD_TORQUE_NM,
-                    )
-                else:
-                    gripper.motor.set_position(
-                        target_rad,
-                        MAX_VELOCITY_RAD_S,
-                        MAX_TORQUE_NM,
-                    )
+                loop = self.control_loop
+                if loop is None:
+                    raise RuntimeError("TacCap ControlLoop is not available")
+                self._start_control_loop_locked()
+                # Current SDKs intentionally do not expose raw Motor
+                # submit_* / set_position methods to Python.  ControlLoop is
+                # the safe normalized [0,1] command surface for both modes.
+                loop.set_target(position)
                 self.target_position = position
                 self.last_lease = time.monotonic()
                 self.last_error = None
                 LOG.info(
-                    "%s target position=%.3f raw=%.4f rad mode=%s",
+                    "%s target position=%.3f mode=%s",
                     self.spec.side,
                     position,
-                    target_rad,
                     self.control_mode,
                 )
             except Exception as exc:
@@ -850,7 +904,9 @@ class GripperController:
                 return
             try:
                 if self.gripper is not None:
+                    self._stop_control_loop_locked()
                     self.gripper.motor.disable()
+                    self._start_control_loop_locked()
                 LOG.warning("%s watchdog expired; motor disabled", self.spec.side)
             except Exception as exc:
                 self.last_error = f"watchdog disable failed: {type(exc).__name__}: {exc}"
@@ -923,6 +979,7 @@ class GripperController:
         with self.lock:
             if self.gripper is not None:
                 try:
+                    self._stop_control_loop_locked()
                     self.gripper.motor.disable()
                 except Exception:
                     LOG.exception("%s shutdown disable failed", self.spec.side)

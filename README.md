@@ -198,9 +198,10 @@ curl -X POST http://10.192.1.4:8765/api/grippers/left/control_mode \
 
 服务支持两种夹爪命令模式，默认是 `position`，以保持旧客户端兼容：
 
-- `position`：发送 SDK 的位置控制命令，使用最大速度和最大力矩限制；
-- `mit`：发送 SDK 的 MIT 阻抗帧 `submit_impedance()`，使用目标位置、`kp`、
-  `kd` 和前馈力矩。该模式使用无 ACK 的实时发送路径，适合 30 Hz 的遥操作。
+- `position`：使用 SDK `ControlLoop` 的保守阻抗增益；
+- `mit`：使用 SDK `ControlLoop` 的 MIT 阻抗增益和前馈力矩。当前 SDK 已经从
+  Python 中移除裸 `Motor.submit_impedance()` / `Motor.set_position()`，因此两种
+  模式都通过 `ControlLoop` 的安全、锁相实时路径发送。
 
 Web 页面中可以分别为左右夹爪选择模式。命令行客户端也可以选择：
 
@@ -219,11 +220,12 @@ TACCAP_LEFT_GRIPPER_CONTROL_MODE=mit
 TACCAP_RIGHT_GRIPPER_CONTROL_MODE=position
 ```
 
-MIT 参数默认是 `kp=8.0`、`kd=1.0`、前馈力矩 `0.0 Nm`，可以通过
+位置模式参数默认是 `kp=8.0`、`kd=1.0`；MIT 参数默认是 `kp=8.0`、`kd=1.0`、
+前馈力矩 `0.0 Nm`，可以通过
+`TACCAP_POSITION_KP`、`TACCAP_POSITION_KD`、
 `TACCAP_MIT_KP`、`TACCAP_MIT_KD` 和 `TACCAP_MIT_FEEDFORWARD_TORQUE` 调整。
-服务状态中的 `command_mode` 表示当前选中的命令路径，`control_mode` 和
-`control_mode_name` 表示电机最后实际应用的固件控制模式；切换模式后发送第一条
-位置命令，后者会更新为对应的 Position 或 Impedance (MIT)。
+服务状态中的 `command_mode` 表示当前选中的增益组；当前 SDK 的安全控制器实际
+发送的是 MIT impedance 帧，`control_mode_name` 会显示 `impedance (MIT)`。
 
 日志统一保存到目标机项目的 `.log/`，文件名包含日期、时间和进程号，例如：
 
