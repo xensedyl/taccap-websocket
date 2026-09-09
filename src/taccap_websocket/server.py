@@ -71,6 +71,7 @@ MAX_DEBUG_KP_NM_PER_RAD = 100.0
 MAX_DEBUG_KD_NM_S_PER_RAD = 50.0
 MAX_DEBUG_FEEDFORWARD_TORQUE_NM = 2.0
 MAX_DEBUG_POSITION_TORQUE_NM = 2.0
+SPEED_CONTROL_POSITION_TOLERANCE = 0.002
 
 MOTOR_MODE_NAMES = {
     0: "idle",
@@ -503,6 +504,11 @@ class GripperController:
         self.latest_status_updated_at_s: float | None = None
         self.applied_target_position: float | None = None
         self._target_update_monotonic = time.monotonic()
+        # The SDK ControlLoop accepts a position target but no velocity target.
+        # Keep the velocity-derived torque contribution visible so the web UI
+        # can distinguish the requested speed from the torque actually used to
+        # follow it.
+        self.speed_feedforward_torque_nm = 0.0
         self.status_sequence = 0
         self.status_stop = threading.Event()
         self.status_thread: threading.Thread | None = None
@@ -530,6 +536,7 @@ class GripperController:
         with self.lock:
             previous = self.control_mode
             self.control_mode = mode
+            self.speed_feedforward_torque_nm = 0.0
             self._apply_control_gains_locked()
             LOG.info(
                 "%s gripper command mode changed: %s -> %s",
@@ -558,6 +565,7 @@ class GripperController:
             "feedforward_torque_nm": ff,
             "max_position_torque_nm": self.max_position_torque_nm,
             "target_max_velocity_rad_s": self.target_max_velocity_rad_s,
+            "speed_feedforward_torque_nm": self.speed_feedforward_torque_nm,
             "control_loop_hz": CONTROL_LOOP_HZ,
             "motor_stream_hz": MOTOR_STREAM_HZ,
             "submit_phase": "STREAM_LOCKED",
@@ -641,6 +649,12 @@ class GripperController:
                     self._mode_gains[mode][name] = value
             if target_velocity is not None:
                 self.target_max_velocity_rad_s = target_velocity
+                # Remove the contribution calculated for the previous speed;
+                # the next status frame will derive a fresh value from the
+                # measured direction and velocity.
+                self.speed_feedforward_torque_nm = 0.0
+            if previous_mode != mode:
+                self.speed_feedforward_torque_nm = 0.0
             rebuild = (
                 max_position_torque is not None
                 and max_position_torque != self.max_position_torque_nm
@@ -651,6 +665,17 @@ class GripperController:
                 self._rebuild_control_loop_locked()
             else:
                 self._apply_control_gains_locked()
+            LOG.info(
+                "%s control parameters updated: mode=%s kp=%.3f kd=%.3f "
+                "ff=%.3f torque_limit=%.3f target_speed=%.3f",
+                self.spec.side,
+                mode,
+                self._mode_gains[mode]["kp_nm_per_rad"],
+                self._mode_gains[mode]["kd_nm_s_per_rad"],
+                self._mode_gains[mode]["feedforward_torque_nm"],
+                self.max_position_torque_nm,
+                self.target_max_velocity_rad_s,
+            )
             if previous_mode != mode:
                 LOG.info(
                     "%s gripper command mode changed by tuning request: %s -> %s",
@@ -667,6 +692,7 @@ class GripperController:
         was_running = bool(old_loop.running)
         if was_running:
             old_loop.stop()
+        self.speed_feedforward_torque_nm = 0.0
         kp, kd, ff = self._control_gains()
         self.control_loop = self.taccap.ControlLoop(
             self.gripper,
@@ -686,9 +712,80 @@ class GripperController:
         if self.control_loop is None:
             return
         kp, kd, ff = self._control_gains()
-        self.control_loop.set_gains(kp, kd, ff)
+        self.control_loop.set_gains(kp, kd, ff + self.speed_feedforward_torque_nm)
 
-    def _advance_target_locked(self, now: float | None = None) -> None:
+    def _update_speed_feedforward_locked(
+        self,
+        actual_position: float | None = None,
+    ) -> None:
+        """Add a bounded MIT torque feed-forward for the requested speed.
+
+        ``ControlLoop.set_target`` is position-only.  A moving target by itself
+        therefore does not constrain the motor's physical velocity.  The MIT
+        law already damps measured velocity with ``kd``; adding a signed
+        velocity-bias torque to the feed-forward term makes the
+        steady-state velocity follow the requested speed when torque headroom
+        is available.  The combined user and speed feed-forward is bounded by
+        the public feed-forward safety range, while ControlLoop and firmware
+        retain their independent torque and stall guards.
+        """
+
+        speed = self.target_max_velocity_rad_s
+        requested = self.target_position
+        cfg = self.config
+        loop = self.control_loop
+        if (
+            loop is None
+            or requested is None
+            or cfg is None
+            or speed <= 0.0
+            or actual_position is None
+            or not math.isfinite(actual_position)
+        ):
+            speed_ff = 0.0
+        else:
+            delta = requested - actual_position
+            # Do not continue driving once the requested normalized target is
+            # within one control tick of the measured position.
+            travel_rad = abs(float(cfg.max_open_rad) - float(cfg.min_open_rad))
+            close_window = SPEED_CONTROL_POSITION_TOLERANCE
+            if abs(delta) <= close_window:
+                speed_ff = 0.0
+            else:
+                _, kd, base_ff = self._control_gains()
+                # Reverse maps normalized opening direction to raw motor
+                # direction.  The feed-forward torque is sent in raw-radian
+                # coordinates, unlike the web target which is normalized.
+                raw_open_direction = -1.0 if int(cfg.flags) & 0x0002 else 1.0
+                raw_direction = raw_open_direction * math.copysign(1.0, delta)
+                # Firmware's MIT velocity feed-forward is not available
+                # through ControlLoop.  Add the algebraically equivalent
+                # torque bias kd*desired_raw_velocity, so
+                # tau = kp*error + kd*(desired_velocity-actual_velocity)
+                # while the one-tick position target remains a small tracking
+                # correction.
+                requested_speed_ff = raw_direction * abs(kd) * speed
+                total_ff = min(
+                    MAX_DEBUG_FEEDFORWARD_TORQUE_NM,
+                    max(
+                        -MAX_DEBUG_FEEDFORWARD_TORQUE_NM,
+                        base_ff + requested_speed_ff,
+                    ),
+                )
+                speed_ff = total_ff - base_ff
+
+        if abs(speed_ff - self.speed_feedforward_torque_nm) <= 1e-6:
+            return
+        self.speed_feedforward_torque_nm = speed_ff
+        kp, kd, base_ff = self._control_gains()
+        loop.set_gains(kp, kd, base_ff + speed_ff)
+
+    def _advance_target_locked(
+        self,
+        now: float | None = None,
+        *,
+        actual_position: float | None = None,
+    ) -> None:
         """Apply the requested target, optionally respecting a raw-rad/s slew limit."""
 
         loop = self.control_loop
@@ -696,31 +793,38 @@ class GripperController:
         if loop is None or requested is None:
             return
         now = time.monotonic() if now is None else now
-        previous = self.applied_target_position
-        if previous is None:
-            previous = requested
-        elapsed = max(0.0, now - self._target_update_monotonic)
         speed = self.target_max_velocity_rad_s
-        if speed > 0.0 and self.config is not None:
+        if speed > 0.0 and self.config is not None and actual_position is not None:
             travel_rad = abs(float(self.config.max_open_rad) - float(self.config.min_open_rad))
             if travel_rad > 1e-6:
-                max_step = speed * elapsed / travel_rad
-                delta = requested - previous
-                if abs(delta) > max_step:
-                    previous += math.copysign(max_step, delta)
+                # A one-tick position look-ahead supplies a small proportional
+                # term while kd*(desired-actual velocity) determines the
+                # physical approach speed.  Deriving it from feedback avoids
+                # an accumulated target getting far ahead of a loaded jaw.
+                lookahead = speed / CONTROL_LOOP_HZ / travel_rad
+                delta = requested - actual_position
+                if abs(delta) <= SPEED_CONTROL_POSITION_TOLERANCE:
+                    applied = requested
                 else:
-                    previous = requested
+                    applied = actual_position + math.copysign(
+                        min(abs(delta), lookahead),
+                        delta,
+                    )
+            else:
+                applied = requested
         else:
-            previous = requested
-        previous = min(1.0, max(0.0, previous))
-        if self.applied_target_position is None or abs(previous - self.applied_target_position) > 1e-7:
-            loop.set_target(previous)
-            self.applied_target_position = previous
+            applied = requested
+        applied = min(1.0, max(0.0, applied))
+        if self.applied_target_position is None or abs(applied - self.applied_target_position) > 1e-7:
+            loop.set_target(applied)
+            self.applied_target_position = applied
         self._target_update_monotonic = now
+        self._update_speed_feedforward_locked(actual_position)
 
     def _start_control_loop_locked(self) -> None:
         if self.control_loop is None or self.control_loop.running:
             return
+        self.speed_feedforward_torque_nm = 0.0
         self._apply_control_gains_locked()
         self.control_loop.start()
         self.applied_target_position = float(self.control_loop.target)
@@ -730,6 +834,7 @@ class GripperController:
         if self.control_loop is None or not self.control_loop.running:
             return
         self.control_loop.stop()
+        self.speed_feedforward_torque_nm = 0.0
 
     def _stop_transport_locked(self) -> None:
         if self.gripper is None:
@@ -895,10 +1000,16 @@ class GripperController:
                         loop = self.control_loop
                         if loop is None or not loop.running:
                             raise RuntimeError("TacCap ControlLoop is not running")
-                        self._advance_target_locked()
                         observation = loop.observation()
                         if not observation.valid:
                             raise RuntimeError("waiting for TacCap motor-status stream")
+                        self._advance_target_locked(
+                            actual_position=float(observation.position),
+                        )
+                        # The speed feed-forward may have changed the gains;
+                        # read the cached observation again only for the
+                        # already-updated public state, not by polling serial.
+                        observation = loop.observation()
                         raw_status = int(observation.status)
                         hardware_enabled = bool(raw_status & 0x0001)
                         if (
@@ -941,6 +1052,7 @@ class GripperController:
                             "control_mode": 4,
                             "control_mode_name": MOTOR_MODE_NAMES[4],
                             "command_mode": self.control_mode,
+                            "speed_feedforward_torque_nm": self.speed_feedforward_torque_nm,
                             "control_parameters": self._control_parameters_locked(),
                             # Compatibility field retained for older clients.
                             "mit_gains": dict(self._mode_gains[CONTROL_MODE_MIT]),
@@ -1083,7 +1195,11 @@ class GripperController:
                 # submit_* / set_position methods to Python.  ControlLoop is
                 # the safe normalized [0,1] command surface for both modes.
                 self.target_position = position
-                self._advance_target_locked(time.monotonic())
+                observation = loop.observation()
+                self._advance_target_locked(
+                    time.monotonic(),
+                    actual_position=float(observation.position) if observation.valid else None,
+                )
                 self.last_lease = time.monotonic()
                 self.last_error = None
                 LOG.info(
@@ -1131,6 +1247,7 @@ class GripperController:
                 value["target_position"] = self.target_position
                 value["command_mode"] = self.control_mode
                 value["applied_target_position"] = self.applied_target_position
+                value["speed_feedforward_torque_nm"] = self.speed_feedforward_torque_nm
                 value["control_parameters"] = self._control_parameters_locked()
                 value["mit_gains"] = dict(self._mode_gains[CONTROL_MODE_MIT])
                 value["lease_remaining_s"] = round(
@@ -1160,6 +1277,7 @@ class GripperController:
             "enabled": False,
             "lease_remaining_s": 0.0,
             "command_mode": self.control_mode,
+            "speed_feedforward_torque_nm": self.speed_feedforward_torque_nm,
             "control_parameters": self._control_parameters_locked(),
             "mit_gains": dict(self._mode_gains[CONTROL_MODE_MIT]),
             "last_error": error,
@@ -1928,7 +2046,8 @@ async function refresh() {
         `位置: ${s.position===undefined?'--':s.position.toFixed(3)}  原始: ${s.raw_position_rad===undefined?'--':s.raw_position_rad.toFixed(4)} rad\n`+
         `命令模式: ${(s.command_mode||'--').toUpperCase()}  电机模式: ${s.control_mode_name||'--'} (${s.control_mode===undefined?'--':s.control_mode})\n`+
         `使能: ${s.enabled?'是':'否'}  服务已授权: ${s.armed?'是':'否'}  剩余: ${Number(s.lease_remaining_s||0).toFixed(1)} s\n`+
-        `速度: ${s.velocity_rad_s===undefined?'--':s.velocity_rad_s.toFixed(3)} rad/s  力矩: ${s.torque_nm===undefined?'--':s.torque_nm.toFixed(3)} Nm\n`+
+        `速度: ${s.velocity_rad_s===undefined?'--':s.velocity_rad_s.toFixed(3)} rad/s  目标: ${s.control_parameters?.target_max_velocity_rad_s===undefined?'--':Number(s.control_parameters.target_max_velocity_rad_s).toFixed(3)} rad/s\n`+
+        `速度前馈力矩: ${s.speed_feedforward_torque_nm===undefined?'--':s.speed_feedforward_torque_nm.toFixed(3)} Nm  实际力矩: ${s.torque_nm===undefined?'--':s.torque_nm.toFixed(3)} Nm\n`+
         `温度: ${s.motor_temp_c===undefined?'--':s.motor_temp_c.toFixed(1)} °C  状态: ${(s.status_flags||[]).join(', ')||'--'}\n`+
         `目标: ${s.target_position===undefined?'--':Number(s.target_position).toFixed(3)}  已应用: ${s.applied_target_position===undefined?'--':Number(s.applied_target_position).toFixed(3)}\n`+
         `${s.last_error||''}`;
