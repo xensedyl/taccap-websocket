@@ -465,6 +465,10 @@ class GripperController:
         self.last_connect_attempt = 0.0
         self.status_condition = threading.Condition()
         self.latest_status: dict[str, Any] | None = None
+        # Wall-clock timestamp of the most recent MCU status sample.  It is
+        # exported on the status stream so remote clients can distinguish a
+        # stale `.4` cache from transport delay on the way to the client.
+        self.latest_status_updated_at_s: float | None = None
         self.status_sequence = 0
         self.status_stop = threading.Event()
         self.status_thread: threading.Thread | None = None
@@ -702,6 +706,7 @@ class GripperController:
                 if value is not None:
                     with self.status_condition:
                         self.latest_status = value
+                        self.latest_status_updated_at_s = time.time()
                         self.status_sequence += 1
                         self.status_condition.notify_all()
             except Exception as exc:
@@ -858,7 +863,13 @@ class GripperController:
     def status(self) -> dict[str, Any]:
         with self.status_condition:
             value = dict(self.latest_status) if self.latest_status is not None else None
+            updated_at_s = self.latest_status_updated_at_s
         if value is not None:
+            if updated_at_s is not None:
+                value["server_status_updated_at_s"] = updated_at_s
+                value["server_cache_age_ms"] = round(
+                    max(0.0, (time.time() - updated_at_s) * 1000.0), 3
+                )
             with self.lock:
                 value["armed"] = self.armed
                 value["target_position"] = self.target_position
@@ -934,6 +945,7 @@ class FrameSource:
         self.sequence = 0
         self.frame_count = 0
         self.last_frame_monotonic = 0.0
+        self.last_frame_wallclock = 0.0
         self.last_error: str | None = None
         self.stop_event = threading.Event()
         self.client_count = 0
@@ -946,6 +958,7 @@ class FrameSource:
             self.sequence += 1
             self.frame_count += 1
             self.last_frame_monotonic = now
+            self.last_frame_wallclock = time.time()
             self._publish_times.append(now)
             self.last_error = None
             self.condition.notify_all()
@@ -955,6 +968,14 @@ class FrameSource:
             if self.latest_frame is None:
                 return None
             return self.sequence, self.latest_frame
+
+    def published_at(self, sequence: int) -> float | None:
+        """Return the wall-clock time at which the current frame was cached."""
+
+        with self.condition:
+            if self.latest_frame is None or sequence != self.sequence:
+                return None
+            return self.last_frame_wallclock
 
     def wait_for_frame(
         self, timeout: float = 5.0, after_sequence: int | None = None
@@ -1707,6 +1728,88 @@ def make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             content = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode()
             self._send_bytes(status, content, "application/json; charset=utf-8")
 
+        def _gripper_status_stream(self, side: str) -> None:
+            """Push each new cached MCU status to one long-lived client.
+
+            The serial reader remains the sole producer.  This endpoint only
+            fans out the already cached status and never touches the MCU, so a
+            slow client cannot change the hardware sampling cadence.  New
+            clients receive the current snapshot immediately and then wait on
+            the controller's condition variable for newer sequence numbers.
+            """
+
+            controller = state.grippers[side]
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.close_connection = True
+            with contextlib.suppress(Exception):
+                self.connection.settimeout(2.0)
+            with contextlib.suppress(Exception):
+                # Avoid Nagle coalescing several tiny NDJSON records into a
+                # burst.  The client consumes the newest cache value, so
+                # prompt delivery matters more than packet efficiency here.
+                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+            last_sequence = -1
+            last_emit_monotonic = 0.0
+            # A duplicate snapshot is a lightweight health heartbeat.  It is
+            # needed when the MCU reader stops producing new sequence numbers:
+            # without it, the client would not learn about a stale `.4` cache
+            # until the HTTP socket's much longer read timeout expires.
+            heartbeat_period_s = 0.02
+            try:
+                while not state.stop_event.is_set():
+                    timed_out = False
+                    with controller.status_condition:
+                        while (
+                            controller.status_sequence <= last_sequence
+                            and not state.stop_event.is_set()
+                        ):
+                            if controller.status_condition.wait(timeout=heartbeat_period_s):
+                                continue
+                            timed_out = True
+                            break
+                        if state.stop_event.is_set():
+                            break
+                        sequence = controller.status_sequence
+
+                    now_monotonic = time.monotonic()
+                    if (
+                        timed_out
+                        and sequence == last_sequence
+                        and now_monotonic - last_emit_monotonic < heartbeat_period_s
+                    ):
+                        continue
+
+                    value = controller.status()
+                    value["server_status_sequence"] = sequence
+                    value["server_sent_at_s"] = time.time()
+                    updated_at_s = value.get("server_status_updated_at_s")
+                    if isinstance(updated_at_s, (int, float)):
+                        value["server_cache_age_ms"] = round(
+                            max(
+                                0.0,
+                                (value["server_sent_at_s"] - float(updated_at_s)) * 1000.0,
+                            ),
+                            3,
+                        )
+                    line = (
+                        json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
+                    ).encode()
+                    self.wfile.write(line)
+                    self.wfile.flush()
+                    last_sequence = sequence
+                    last_emit_monotonic = now_monotonic
+            except (BrokenPipeError, ConnectionResetError, socket.timeout, TimeoutError):
+                # A client disappearing is normal for a long-lived stream;
+                # do not attempt to write a second HTTP error response after
+                # the 200 headers have already been sent.
+                pass
+
         def _read_json(self) -> dict[str, Any]:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -1747,9 +1850,15 @@ def make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                             "camera_target_fps": CAMERA_STREAM_FPS,
                             "tactile_target_fps": TACTILE_STREAM_FPS,
                             "camera_transport": "persistent producers + latest-frame fanout",
+                            "gripper_status_stream": True,
                         },
                     )
                     return
+                if path.startswith("/api/grippers/") and path.endswith("/stream"):
+                    side = path[len("/api/grippers/") : -len("/stream")].strip("/")
+                    if side in state.grippers:
+                        self._gripper_status_stream(side)
+                        return
                 if path == "/api/grippers":
                     self._json(
                         HTTPStatus.OK,
@@ -1869,6 +1978,10 @@ def make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                         + str(len(frame)).encode()
                         + b"\r\nX-Source-Sequence: "
                         + str(sequence).encode()
+                        + b"\r\nX-Source-Published-At: "
+                        + f"{camera.published_at(sequence) or time.time():.6f}".encode()
+                        + b"\r\nX-Server-Sent-At: "
+                        + f"{time.time():.6f}".encode()
                         + b"\r\n\r\n"
                     )
                     self.wfile.write(header)

@@ -11,21 +11,23 @@ snapshot. It does not need Python, pip, uv, Git, a compiler or network access.
 
 The vendor SDKs are installed from their normal sources:
   xensesdk       installed by package name (pip/PyPI or configured index)
-  taccap-gripper installed from the TacCap-Gripper source repository
+  taccap-gripper installed from the TacCap-Gripper source repository, or from
+                  --taccap-wheel when the build host ABI differs from target
 
 Options:
   --output DIR                 Output directory (default: ./offline)
   --xensesdk SPEC              xensesdk requirement (default: xensesdk==2.1.3)
   --taccap-source PATH|URL     Source checkout or Git URL
                                (default: XenseRobotics-AI/TacCap-Gripper)
+  --taccap-wheel PATH          Prebuilt TacCap wheel from a compatible host
   --python PATH                Resolver Python 3.12+ (default: python3)
   -h, --help                   Show this help
 
 The build host must have network access for xensesdk and the source-build
-dependencies. The C++ build also needs OpenCV development libraries and
-spdlog (from the host or from TACCAP_CPP_PREFIX). No wheel is copied into the
-release bundle; pip may create temporary artifacts while installing the
-source package.
+dependencies. A source build also needs OpenCV development libraries and
+spdlog (from the host or from TACCAP_CPP_PREFIX). A prebuilt wheel is only
+installed into the temporary environment; the release contains its unpacked
+site-packages, not a .whl file.
 USAGE
 }
 
@@ -34,6 +36,7 @@ output_dir="$project_dir/offline"
 python_bin="${TACCAP_BUNDLE_PYTHON:-python3}"
 xensesdk_requirement="${TACCAP_XENSESDK_REQUIREMENT:-xensesdk==2.1.3}"
 taccap_source="${TACCAP_TACCAP_SOURCE:-https://github.com/XenseRobotics-AI/TacCap-Gripper.git}"
+taccap_wheel="${TACCAP_TACCAP_WHEEL:-}"
 
 while (($#)); do
     case "$1" in
@@ -46,6 +49,9 @@ while (($#)); do
         --taccap-source)
             (($# >= 2)) || { echo "missing argument for --taccap-source" >&2; exit 2; }
             taccap_source="$2"; shift 2 ;;
+        --taccap-wheel)
+            (($# >= 2)) || { echo "missing argument for --taccap-wheel" >&2; exit 2; }
+            taccap_wheel="$2"; shift 2 ;;
         --python)
             (($# >= 2)) || { echo "missing argument for --python" >&2; exit 2; }
             python_bin="$2"; shift 2 ;;
@@ -53,6 +59,33 @@ while (($#)); do
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+# Keep the bundle build isolated from an activated ROS/Conda Python setup.
+# In particular, an inherited PYTHONPATH can make the portable interpreter
+# import host packages (or an incomplete stdlib), producing a bundle that only
+# fails later on the target.  The C++ prefix variables are intentionally kept;
+# they are handled separately below for source builds.
+unset PYTHONPATH PYTHONHOME PYTHONUSERBASE LD_LIBRARY_PATH
+export PYTHONNOUSERSITE=1
+
+# When bundle.sh is run from an activated conda/mamba environment, use that
+# environment for CMake dependencies automatically. Without this, the
+# compiler can find fmt/spdlog through CMake but the later ldd/import check
+# cannot find the same shared libraries.
+# A source build needs the build host's C++ prefix.  A prebuilt wheel is
+# intentionally not resolved against the build host: a wheel produced on the
+# Ubuntu 20.04 target may depend on system OpenCV 4.2, which is absent from a
+# Ubuntu 22.04 build host and must be resolved by the target preflight.
+if [[ -z "$taccap_wheel" && -z "${TACCAP_CPP_PREFIX:-}" ]]; then
+    for candidate in "${CONDA_PREFIX:-}" "${MAMBA_PREFIX:-}"; do
+        if [[ -n "$candidate" && -d "$candidate/lib" ]]; then
+            TACCAP_CPP_PREFIX="$candidate"
+            export TACCAP_CPP_PREFIX
+            echo "Using C++ dependency prefix: $TACCAP_CPP_PREFIX"
+            break
+        fi
+    done
+fi
 
 command -v "$python_bin" >/dev/null 2>&1 || [[ -x "$python_bin" ]] || {
     echo "resolver Python not found: $python_bin" >&2
@@ -66,14 +99,16 @@ command -v uv >/dev/null 2>&1 || {
     echo "uv is required on the connected build host" >&2
     exit 1
 }
-command -v git >/dev/null 2>&1 || {
-    echo "git is required to identify/install TacCap-Gripper" >&2
-    exit 1
-}
-command -v c++ >/dev/null 2>&1 || {
-    echo "a C++ compiler (c++) is required to build TacCap-Gripper from source" >&2
-    exit 1
-}
+if [[ -z "$taccap_wheel" ]]; then
+    command -v git >/dev/null 2>&1 || {
+        echo "git is required to identify/install TacCap-Gripper" >&2
+        exit 1
+    }
+    command -v c++ >/dev/null 2>&1 || {
+        echo "a C++ compiler (c++) is required to build TacCap-Gripper from source" >&2
+        exit 1
+    }
+fi
 
 # TacCap-Gripper's CMake project links the C++ OpenCV and spdlog packages.
 # A conda/mamba prefix is common on the development host; make it explicit so
@@ -103,29 +138,40 @@ source_dir=""
 source_tmp=""
 build_root=""
 runtime_tmp=""
+bundle_created=0
 cleanup() {
+    if ((bundle_created == 0)) && [[ -d "$output_dir" ]]; then
+        rm -rf -- "$output_dir"
+    fi
     [[ -n "$build_root" ]] && rm -rf -- "$build_root"
     [[ -n "$source_tmp" ]] && rm -rf -- "$source_tmp"
     [[ -n "$runtime_tmp" ]] && rm -rf -- "$runtime_tmp"
 }
 trap cleanup EXIT
 
-if [[ -d "$taccap_source" ]]; then
-    source_dir="$(cd -- "$taccap_source" && pwd)"
-elif [[ "$taccap_source" =~ ^(https?|ssh|git)://|^git@ ]]; then
-    source_tmp="$(mktemp -d /tmp/taccap-gripper-source.XXXXXX)"
-    echo "Cloning TacCap-Gripper source: $taccap_source"
-    git clone --depth 1 "$taccap_source" "$source_tmp/TacCap-Gripper"
-    source_dir="$source_tmp/TacCap-Gripper"
+if [[ -n "$taccap_wheel" ]]; then
+    [[ -f "$taccap_wheel" ]] || {
+        echo "TacCap wheel not found: $taccap_wheel" >&2
+        exit 1
+    }
 else
-    echo "TacCap-Gripper source directory or Git URL not found: $taccap_source" >&2
-    echo "Use --taccap-source /path/to/TacCap-Gripper or the repository URL." >&2
-    exit 1
+    if [[ -d "$taccap_source" ]]; then
+        source_dir="$(cd -- "$taccap_source" && pwd)"
+    elif [[ "$taccap_source" =~ ^(https?|ssh|git)://|^git@ ]]; then
+        source_tmp="$(mktemp -d /tmp/taccap-gripper-source.XXXXXX)"
+        echo "Cloning TacCap-Gripper source: $taccap_source"
+        git clone --depth 1 "$taccap_source" "$source_tmp/TacCap-Gripper"
+        source_dir="$source_tmp/TacCap-Gripper"
+    else
+        echo "TacCap-Gripper source directory or Git URL not found: $taccap_source" >&2
+        echo "Use --taccap-source /path/to/TacCap-Gripper or --taccap-wheel /path/to/taccap_gripper.whl." >&2
+        exit 1
+    fi
+    [[ -f "$source_dir/pyproject.toml" ]] || {
+        echo "TacCap-Gripper source has no pyproject.toml: $source_dir" >&2
+        exit 1
+    }
 fi
-[[ -f "$source_dir/pyproject.toml" ]] || {
-    echo "TacCap-Gripper source has no pyproject.toml: $source_dir" >&2
-    exit 1
-}
 
 rm -rf -- "$output_dir"
 mkdir -p "$output_dir"
@@ -178,17 +224,27 @@ build_python="$build_venv/bin/python"
 # any system or conda tools while installing TacCap-Gripper.
 export PATH="$build_venv/bin:$PATH"
 
-echo "[3/6] Installing source-build tools"
-"$build_python" -m pip install --disable-pip-version-check --no-cache-dir \
-    "setuptools>=68" "scikit-build-core>=0.10" "pybind11>=2.12" cmake ninja
+if [[ -n "$taccap_wheel" ]]; then
+    echo "[3/6] Skipping source-build tools (prebuilt TacCap wheel)"
+else
+    echo "[3/6] Installing source-build tools"
+    "$build_python" -m pip install --disable-pip-version-check --no-cache-dir \
+        "setuptools>=68" "scikit-build-core>=0.10" "pybind11>=2.12" cmake ninja
+fi
 
 echo "[4/6] Installing public dependencies and xensesdk"
 "$build_python" -m pip install --disable-pip-version-check --no-cache-dir \
     numpy==2.2.4 opencv-python==4.12.0.88 "$xensesdk_requirement"
 
-echo "[5/6] Building/installing TacCap-Gripper from source"
-"$build_python" -m pip install --disable-pip-version-check --no-cache-dir \
-    --no-build-isolation "$source_dir"
+if [[ -n "$taccap_wheel" ]]; then
+    echo "[5/6] Installing prebuilt TacCap-Gripper wheel"
+    "$build_python" -m pip install --disable-pip-version-check --no-cache-dir \
+        --no-deps "$taccap_wheel"
+else
+    echo "[5/6] Building/installing TacCap-Gripper from source"
+    "$build_python" -m pip install --disable-pip-version-check --no-cache-dir \
+        --no-build-isolation "$source_dir"
+fi
 
 # Install this project into the same environment so its package metadata and
 # console entry point are available when the snapshot is restored on target.
@@ -200,15 +256,42 @@ site_packages="$("$build_python" -c 'import site; print(site.getsitepackages()[0
     echo "temporary site-packages directory not found: $site_packages" >&2
     exit 1
 }
-# A native TacCap build may use libraries from TACCAP_CPP_PREFIX.  Put that
-# prefix first while checking imports and collecting the small transitive
-# runtime closure below; the target itself may not have the same ABI.
-if [[ -n "${TACCAP_CPP_PREFIX:-}" ]]; then
+# A native TacCap source build may use libraries from TACCAP_CPP_PREFIX.  A
+# prebuilt target wheel must instead resolve against the target's system
+# libraries, so do not inject the development machine's C++ prefix for it.
+if [[ -n "${TACCAP_CPP_PREFIX:-}" && -z "$taccap_wheel" ]]; then
     export LD_LIBRARY_PATH="$TACCAP_CPP_PREFIX/lib:$site_packages/xense/taccap${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
+# Refuse to package a native extension whose direct dependencies are not
+# resolvable on the build host. Packaging such a bundle only postpones the
+# failure until deployment.
+native_module="$(find "$site_packages/xense/taccap" -maxdepth 1 -type f -name '_taccap_native*.so' -print -quit)"
+[[ -n "$native_module" ]] || {
+    echo "TacCap native extension was not built: xense/taccap/_taccap_native*.so is missing" >&2
+    exit 1
+}
+native_ldd="$(ldd "$native_module" 2>&1 || true)"
+native_import_deferred=0
+if grep -qE '=> not found|^[[:space:]]*[^[:space:]].*not found' <<<"$native_ldd"; then
+    if [[ -n "$taccap_wheel" ]]; then
+        # A compatible target wheel can legitimately refer to system SONAMEs
+        # that do not exist on the connected build host (notably OpenCV 4.2
+        # on Ubuntu 20.04).  The target installer performs the authoritative
+        # import check after unpacking the bundle, using its own system libs.
+        native_import_deferred=1
+        echo "Warning: target wheel has host-unresolved shared libraries; deferring check to target:" >&2
+        grep -E '=> not found|^[[:space:]]*[^[:space:]].*not found' <<<"$native_ldd" >&2
+    else
+        echo "TacCap native extension has unresolved shared-library dependencies:" >&2
+        grep -E '=> not found|^[[:space:]]*[^[:space:]].*not found' <<<"$native_ldd" >&2
+        echo "Set TACCAP_CPP_PREFIX to the C++ dependency prefix used for the build, or build on a compatible target OS." >&2
+        exit 1
+    fi
+fi
+
 runtime_libs_archive="$output_dir/runtime-libs.tar.gz"
-if [[ -n "${TACCAP_CPP_PREFIX:-}" ]]; then
+if [[ -n "${TACCAP_CPP_PREFIX:-}" && -z "$taccap_wheel" ]]; then
     runtime_libs_stage="$(mktemp -d /tmp/taccap-runtime-libs.XXXXXX)"
     "$build_python" - "$site_packages" "$TACCAP_CPP_PREFIX" "$runtime_libs_stage" <<'PY'
 import os
@@ -293,16 +376,30 @@ fi
 "$build_python" - <<'PY'
 import importlib
 
-for module in ("xensesdk", "xense.taccap"):
-    importlib.import_module(module)
-    print(f"verified import: {module}")
+importlib.import_module("xensesdk")
+print("verified import: xensesdk")
 PY
+if ((native_import_deferred == 0)); then
+    "$build_python" - <<'PY'
+import importlib
+
+importlib.import_module("xense.taccap")
+print("verified import: xense.taccap")
+PY
+else
+    echo "deferred import: xense.taccap (target system libraries will be checked by deploy.sh)"
+fi
 
 echo "[6/6] Packing installed Python dependencies"
 tar -czf "$output_dir/site-packages.tar.gz" -C "$site_packages" .
 
-source_commit="$(git -C "$source_dir" rev-parse HEAD 2>/dev/null || echo unknown)"
-source_remote="$(git -C "$source_dir" remote get-url origin 2>/dev/null || printf '%s' "$taccap_source")"
+if [[ -n "$taccap_wheel" ]]; then
+    source_commit="prebuilt-wheel:$(basename "$taccap_wheel")"
+    source_remote="prebuilt-wheel"
+else
+    source_commit="$(git -C "$source_dir" rev-parse HEAD 2>/dev/null || echo unknown)"
+    source_remote="$(git -C "$source_dir" remote get-url origin 2>/dev/null || printf '%s' "$taccap_source")"
+fi
 manifest="$output_dir/manifest.txt"
 {
     printf 'bundle_created=%s\n' "$(date --iso-8601=seconds)"
@@ -310,6 +407,7 @@ manifest="$output_dir/manifest.txt"
     printf 'xensesdk_requirement=%s\n' "$xensesdk_requirement"
     printf 'taccap_source=%s\n' "$source_remote"
     printf 'taccap_commit=%s\n\n' "$source_commit"
+    printf 'taccap_native_import=%s\n' "$([[ $native_import_deferred == 1 ]] && echo deferred-target || echo verified-build-host)"
     printf 'sha256:\n'
     (cd "$output_dir" && sha256sum site-packages.tar.gz)
     if [[ -n "$runtime_libs_archive" ]]; then
@@ -318,5 +416,6 @@ manifest="$output_dir/manifest.txt"
 } >"$manifest"
 
 echo "Offline release ready: $output_dir"
+bundle_created=1
 du -sh "$output_dir"
 echo "Next: ./deploy.sh user@TARGET --bundle $output_dir"

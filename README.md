@@ -7,6 +7,10 @@ USB 设备的机器人主机上，通过 HTTP 向局域网中的 LeRobot 或其�
 - `left_wrist`、`right_wrist` 两路腕部视频；
 - `left_tactile_left/right`、`right_tactile_left/right` 四路触觉视频；
 - `/api/health`、`/api/grippers`、`/api/cameras` 诊断接口。
+- `/api/grippers/{side}/stream` 持续推送 `.4` 已缓存的最新夹爪状态（NDJSON），供
+  LeRobot 无轮询读取；每条记录包含 `server_status_sequence`、
+  `server_status_updated_at_s`、`server_sent_at_s` 和 `server_cache_age_ms`，用于定位
+  `.4` 采样停顿或到客户端的传输延迟。
 
 触觉由 `xensesdk.Sensor.OutputType.Rectify` 采集，SDK 参数为
 `rectify_size=(400, 700)`（宽、高），输出保持标定矫正图像格式。
@@ -38,14 +42,17 @@ taccap-websocket/
 （若 `uv` 无法下载 portable Python，可设置 `TACCAP_BUNDLE_RUNTIME` 指向一个
 已准备好的 Python 3.12 runtime 目录。）
 
-如果 C++ 依赖安装在 conda/mamba 环境而不是系统路径，先指定该环境的前缀：
+如果 C++ 依赖安装在 conda/mamba 环境而不是系统路径，脚本会自动使用当前已激活
+环境的 `CONDA_PREFIX`/`MAMBA_PREFIX`。也可以显式指定该环境的前缀：
 
 ```bash
 export TACCAP_CPP_PREFIX=/path/to/cpp-deps-env
 ```
 
-这个前缀只用于构建机编译；目标机不需要 conda 或编译器，但仍需要与构建产物
-ABI 兼容的系统运行库（尤其是 glibc、libstdc++ 和 OpenCV 运行库）。
+这个前缀只用于构建机编译。`xense.taccap` 含有 C++ 原生扩展，必须在不高于目标
+系统 ABI 的环境中构建：例如要部署到 Ubuntu 20.04，就应在 Ubuntu 20.04/glibc
+2.31 的构建机（或兼容构建机）生成 bundle。Ubuntu 22.04 上生成的扩展可能要求
+`GLIBC_2.32` 或更高版本，不能部署到 Ubuntu 20.04。
 
 ```bash
 cd /home/xense/tron2/taccap-websocket
@@ -68,6 +75,34 @@ bundle 则允许用 `--taccap-source` 指向本机 checkout，避免重复 clone
 ./bundle.sh --taccap-source /home/xense/tron2/TacCap-Gripper
 ```
 
+如果本机不是 Ubuntu 20.04，不要在本机编译 TacCap 原生扩展。先在 Ubuntu 20.04
+构建机上生成 wheel，再复制回本机组装 bundle。当前 `.4` 使用系统 OpenCV 4.2，
+因此不能使用在 Ubuntu 22.04 上编译、依赖 `libopencv_*.so.4.5d` 的 wheel：
+
+```bash
+./bundle.sh \
+  --taccap-wheel /path/to/taccap_gripper-*.whl \
+  --xensesdk 'xensesdk==2.1.3'
+```
+
+`--taccap-wheel` 只替换 TacCap 原生扩展来源；Python runtime、xensesdk 和离线
+归档仍由本机生成。wheel 必须来自不高于目标系统 ABI 的构建机。脚本不会在构建
+机上强行加载目标机没有的 OpenCV SONAME，而是把最终导入检查留给目标机；这样
+Ubuntu 20.04 的系统 `libopencv_*.so.4.2` 可以正常解析。
+
+本项目开发机已经保存了一份可供 `.4` 使用的 wheel，可直接执行：
+
+```bash
+cd /home/xense/tron2/taccap-websocket
+./bundle.sh \
+  --taccap-wheel /home/xense/taccap-sdk-wheels/taccap_gripper-0.1.9-cp312-cp312-linux_x86_64.whl \
+  --xensesdk 'xensesdk==2.1.3'
+```
+
+不要把之前用普通 `--taccap-source` 在 Ubuntu 22.04 上生成的 `offline/` 继续部署
+到 `.4`；其中的原生模块会绑定 `libopencv_core.so.4.5d`，并可能要求高于
+Ubuntu 20.04 的 glibc。重新生成 bundle 后再执行 `./deploy.sh guest@10.192.1.4`。
+
 若 `xensesdk` 不是默认版本，可传入 requirement：
 
 ```bash
@@ -77,6 +112,11 @@ bundle 则允许用 `--taccap-source` 指向本机 checkout，避免重复 clone
 下载、编译和安装只发生在联网构建机；目标机只解包已安装的 Python 文件，完全不会
 访问 Python 包索引，也不需要 pip、uv、Git 或编译器。发布包不包含任何 `.whl`；
 构建过程中 pip 产生的临时构建产物会在脚本退出时删除。
+
+安装器会在停止现有服务前，在临时目录中导入 `xensesdk` 和 `xense.taccap` 做 ABI
+预检。预检失败会直接报错并退出，不会使用目标机遗留的 `/home/guest/py312`、
+系统 Python 或旧 TacCap SDK 作为替代。此时必须在兼容的 Ubuntu 20.04 构建机重新
+生成 bundle。
 
 ### 2. SSH 一键部署到新设备
 
@@ -126,6 +166,8 @@ ssh-copy-id guest@10.192.1.4
 ```bash
 cd ~/taccap-websocket
 ./scripts/taccap.sh status
+./scripts/taccap.sh start
+./scripts/taccap.sh stop
 ./scripts/taccap.sh health
 ./scripts/taccap.sh doctor
 ./scripts/taccap.sh restart
@@ -141,6 +183,9 @@ curl http://10.192.1.4:8765/api/cameras
 
 # 查询当前命令模式
 curl http://10.192.1.4:8765/api/grippers/left
+
+# 持续查看左夹爪缓存状态（每行一个 JSON 快照）
+curl -N http://10.192.1.4:8765/api/grippers/left/stream
 
 # 切换左夹爪到 MIT 阻抗模式
 curl -X POST http://10.192.1.4:8765/api/grippers/left/control_mode \

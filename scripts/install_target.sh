@@ -56,19 +56,94 @@ fi
 command -v curl >/dev/null 2>&1 || { echo "curl is required on target" >&2; exit 1; }
 command -v ffmpeg >/dev/null 2>&1 || { echo "ffmpeg is required on target" >&2; exit 1; }
 
-# Stop only the existing TacCap service in the requested installation
-# directory before replacing its source/runtime.  This also handles the old
-# flat layout used by early releases, so an upgrade cannot leave an old
-# process listening on port 8765.
+echo "Verifying offline bundle: $offline_dir"
+awk 'BEGIN { hashes=0 } /^sha256:/ { hashes=1; next } hashes && NF { print }' \
+    "$offline_dir/manifest.txt" | (cd "$offline_dir" && sha256sum -c -)
+
+# Preflight the native modules before stopping a currently working service or
+# replacing its runtime.  This is intentionally performed in a disposable
+# directory because Python extensions are ABI-sensitive: a wheel built on
+# Ubuntu 22.04 can import xensesdk successfully and then fail on
+# xense.taccap with GLIBC_2.32/2.34 errors on Ubuntu 20.04.  A failed
+# preflight leaves the existing installation untouched and never falls back
+# to an interpreter or SDK from another directory.
+preflight_dir="$(mktemp -d /tmp/taccap-preflight.XXXXXX)"
+preflight_cleanup() { rm -rf -- "$preflight_dir"; }
+trap preflight_cleanup EXIT
+mkdir -p "$preflight_dir/python" "$preflight_dir/site-packages" "$preflight_dir/lib"
+tar -cf - -C "$offline_dir/python" . | tar -xf - -C "$preflight_dir/python"
+tar -xzf "$offline_dir/site-packages.tar.gz" -C "$preflight_dir/site-packages"
+if [[ -f "$offline_dir/runtime-libs.tar.gz" ]]; then
+    tar -xzf "$offline_dir/runtime-libs.tar.gz" -C "$preflight_dir/lib"
+fi
+preflight_python="$(find "$preflight_dir/python" \( -type f -o -type l \) \
+    -path '*/bin/python3.12' -print -quit)"
+[[ -x "$preflight_python" ]] || {
+    echo "offline bundle has no Python 3.12 executable for ABI preflight" >&2
+    exit 1
+}
+# A portable Python archive can be copied from a build host with a different
+# locale.  Verify that its standard-library codecs are present before pip or
+# the SDK import is attempted; this catches incomplete runtimes (for example,
+# a missing encodings/cp437.py) at the bundle boundary.
+if ! preflight_codec_output="$(
+    env -u PYTHONPATH -u PYTHONHOME -u PYTHONUSERBASE \
+    PYTHONNOUSERSITE=1 "$preflight_python" 2>&1 <<'PY'
+import codecs
+codecs.lookup("cp437")
+print("verified codec: cp437")
+PY
+)"; then
+    printf '%s\n' "$preflight_codec_output" >&2
+    echo "ERROR: offline Python runtime is incomplete (cp437 codec is missing)." >&2
+    echo "Regenerate the bundle with a complete Python 3.12 runtime." >&2
+    exit 1
+fi
+printf '%s\n' "$preflight_codec_output"
+preflight_output=""
+# Do not inherit ROS/conda/old-SDK libraries from the target shell.  A
+# prebuilt wheel must resolve against the target's default system loader
+# paths (Ubuntu 20.04 OpenCV 4.2), plus libraries explicitly shipped in
+# this bundle.
+if ! preflight_output="$(
+    env -u PYTHONPATH -u PYTHONHOME -u PYTHONUSERBASE \
+    PYTHONNOUSERSITE=1 \
+    PYTHONPATH="$preflight_dir/site-packages" \
+    LD_LIBRARY_PATH="$preflight_dir/lib" \
+    "$preflight_python" - 2>&1 <<'PY'
+import importlib
+
+for module in ("xensesdk", "xense.taccap"):
+    importlib.import_module(module)
+    print(f"verified import: {module}")
+PY
+)"; then
+    printf '%s\n' "$preflight_output" >&2
+    echo >&2
+    echo "ERROR: offline xense.taccap native extension is incompatible with this target." >&2
+    if grep -qE 'cannot open shared object file|=> not found' <<<"$preflight_output"; then
+        echo "ERROR: the bundle references a shared library that is not available on the target." >&2
+        echo "ERROR: for Ubuntu 20.04, use a TacCap wheel built against its system OpenCV 4.2 libraries." >&2
+    elif grep -qE 'GLIBC_[0-9].*not found|GLIBCXX_[0-9].*not found|CXXABI_[0-9].*not found' <<<"$preflight_output"; then
+        echo "ERROR: the bundle was built against a newer glibc/libstdc++ ABI than this target." >&2
+    fi
+    echo "ERROR: deployment aborted before stopping the existing service." >&2
+    echo "ERROR: no /home/guest/py312, system Python, or old SDK fallback is attempted." >&2
+    echo "Build TacCap-Gripper on an Ubuntu 20.04/glibc 2.31 builder (or use a compatible prebuilt artifact), then regenerate the offline bundle." >&2
+    exit 1
+fi
+printf '%s\n' "$preflight_output"
+preflight_cleanup
+trap - EXIT
+
+# The bundle passed its ABI preflight.  Stop only the existing TacCap service
+# in the requested installation directory before replacing its source/runtime.
+# This also handles the old flat layout used by early releases.
 if [[ -x "$install_dir/scripts/taccap.sh" ]]; then
     "$install_dir/scripts/taccap.sh" stop >/dev/null 2>&1 || true
 elif [[ -x "$install_dir/taccap.sh" ]]; then
     "$install_dir/taccap.sh" stop >/dev/null 2>&1 || true
 fi
-
-echo "Verifying offline bundle: $offline_dir"
-awk 'BEGIN { hashes=0 } /^sha256:/ { hashes=1; next } hashes && NF { print }' \
-    "$offline_dir/manifest.txt" | (cd "$offline_dir" && sha256sum -c -)
 
 mkdir -p "$install_dir/.runtime"
 runtime_stage="$(mktemp -d "$install_dir/.runtime/.python.XXXXXX")"
@@ -141,15 +216,46 @@ site_packages="$($python_bin -c 'import site; print(site.getsitepackages()[0])')
 [[ -d "$site_packages" ]] || { echo "target venv site-packages not found: $site_packages" >&2; exit 1; }
 tar -xzf "$offline_dir/site-packages.tar.gz" -C "$site_packages"
 if [[ -n "$runtime_lib_dir" ]]; then
-    export LD_LIBRARY_PATH="$runtime_lib_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LD_LIBRARY_PATH="$runtime_lib_dir"
+else
+    # Match the preflight environment exactly.  In particular, do not let a
+    # ROS/conda LD_LIBRARY_PATH make post-install verification import an old
+    # SDK successfully by accident.
+    unset LD_LIBRARY_PATH
 fi
-"$python_bin" - <<'PY'
+
+# Native extensions are part of the release contract.  A bundle built on a
+# newer distribution must fail here when it requires newer glibc/libstdc++;
+# never fall back to an interpreter or SDK left in /home/guest/py312 (or any
+# other pre-existing environment).  Falling back would make a deployment look
+# successful while silently changing the tactile SDK and control behavior.
+verify_output=""
+if ! verify_output="$(
+    env -u PYTHONPATH -u PYTHONHOME -u PYTHONUSERBASE \
+    PYTHONNOUSERSITE=1 \
+    LD_LIBRARY_PATH="${runtime_lib_dir:-}" \
+    "$python_bin" 2>&1 <<'PY'
 import importlib
 
 for module in ("xensesdk", "xense.taccap"):
     importlib.import_module(module)
     print(f"verified import: {module}")
 PY
+)"; then
+    printf '%s\n' "$verify_output" >&2
+    echo >&2
+    echo "ERROR: offline xense.taccap native extension is incompatible with this target." >&2
+    if grep -qE 'cannot open shared object file|=> not found' <<<"$verify_output"; then
+        echo "ERROR: the bundle references a shared library that is not available on the target." >&2
+        echo "ERROR: for Ubuntu 20.04, use a TacCap wheel built against its system OpenCV 4.2 libraries." >&2
+    elif grep -qE 'GLIBC_[0-9].*not found|GLIBCXX_[0-9].*not found|CXXABI_[0-9].*not found' <<<"$verify_output"; then
+        echo "ERROR: the bundle was built against a newer glibc/libstdc++ ABI than this target." >&2
+    fi
+    echo "ERROR: deployment aborted; no legacy Python/SDK fallback is attempted." >&2
+    echo "Build the TacCap native extension on the target's OS/ABI (Ubuntu 20.04/glibc 2.31 for this device), then regenerate the offline bundle." >&2
+    exit 1
+fi
+printf '%s\n' "$verify_output"
 
 set_config_value() {
     local name="$1" value="$2" tmp
@@ -166,6 +272,9 @@ set_config_value TACCAP_PYTHON "$python_bin"
 set_config_value TACCAP_ENV_SCRIPT ""
 set_config_value TACCAP_PYTHON_HOME "$install_dir/.runtime/python"
 set_config_value TACCAP_LD_LIBRARY_PATH "${runtime_lib_dir:-}"
+# Do not inherit a native module from an older installation.  A successful
+# deployment must use only the verified module inside the new bundle.
+set_config_value TACCAP_PYTHONPATH ""
 
 chmod +x "$install_dir/scripts/taccap.sh"
 for legacy_file in server.py tactile_worker.py client.py taccap.sh install.sh bundle_offline.sh; do

@@ -1,9 +1,10 @@
 # SDK 来源与离线发布
 
 发布包在有网络且具备 C++ 编译器、OpenCV/spdlog 开发包的开发机上生成，目标设备不需要网络、
-pip、uv、Git 或编译器。
-构建 C++ 依赖在非系统前缀时，可设置 `TACCAP_CPP_PREFIX` 指向该前缀；脚本会把它
-加入 CMake 的搜索路径。
+pip、uv、Git 或编译器。由于 `xense.taccap` 包含原生扩展，构建机的 glibc 版本不能
+高于目标设备；Ubuntu 20.04 目标应使用 Ubuntu 20.04/glibc 2.31 构建机。
+构建 C++ 依赖在非系统前缀时，脚本会自动使用已激活 conda/mamba 环境的前缀；也
+可设置 `TACCAP_CPP_PREFIX` 指向该前缀，脚本会把它加入 CMake 的搜索路径。
 如果构建机无法由 `uv` 下载 portable Python，可用 `TACCAP_BUNDLE_RUNTIME` 指定已
 准备好的 Python 3.12 runtime 目录。
 
@@ -30,4 +31,5 @@ pip、uv、Git 或编译器。
 ```
 
 目标设备收到的 bundle 只包含 portable Python、安装后的 site-packages 归档和
-校验清单，不包含任何 `.whl`。
+校验清单，不包含任何 `.whl`。安装前会严格验证两个原生 SDK 的导入；ABI 不兼容
+会终止部署，不会回退到目标机已有的 Python 或 SDK。

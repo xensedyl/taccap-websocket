@@ -16,13 +16,24 @@ if [[ -n "${TACCAP_ENV_SCRIPT:-}" ]]; then
     source "$TACCAP_ENV_SCRIPT" >/dev/null
 fi
 if [[ -n "${TACCAP_PYTHONPATH:-}" ]]; then
-    export PYTHONPATH="$TACCAP_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}"
+    export PYTHONPATH="$TACCAP_PYTHONPATH"
+else
+    # The device service is self-contained.  Do not let a caller's ROS or
+    # conda PYTHONPATH leak host modules into the bundled interpreter.
+    unset PYTHONPATH
 fi
+unset PYTHONHOME PYTHONUSERBASE
+export PYTHONNOUSERSITE=1
 if [[ -n "${TACCAP_LD_LIBRARY_PATH:-}" ]]; then
-    export LD_LIBRARY_PATH="$TACCAP_LD_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LD_LIBRARY_PATH="$TACCAP_LD_LIBRARY_PATH"
+else
+    # Never inherit ROS/conda/old-SDK libraries into the managed service.  An
+    # empty value means the native extension must use the target's default
+    # system loader paths.
+    unset LD_LIBRARY_PATH
 fi
 
-python_bin="${TACCAP_PYTHON:-python3}"
+python_bin="${TACCAP_PYTHON:-}"
 bind_host="${TACCAP_BIND_HOST:-0.0.0.0}"
 port="${TACCAP_PORT:-8765}"
 ffmpeg_bin="${TACCAP_FFMPEG:-/usr/bin/ffmpeg}"
@@ -63,6 +74,10 @@ has_user_service() {
 }
 
 check_runtime() {
+    if [[ -z "$python_bin" ]]; then
+        echo "TACCAP_PYTHON is not configured; install a bundle with ./deploy.sh" >&2
+        return 1
+    fi
     if ! command -v "$python_bin" >/dev/null 2>&1 && [[ ! -x "$python_bin" ]]; then
         echo "Python executable not found: $python_bin" >&2
         return 1
