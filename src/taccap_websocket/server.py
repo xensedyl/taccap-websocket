@@ -517,7 +517,7 @@ class GripperController:
                 MIT_KD_NM_S_PER_RAD,
                 MIT_FEEDFORWARD_TORQUE_NM,
             )
-        return POSITION_KP_NM_PER_RAD, POSITION_KD_NM_PER_RAD, 0.0
+        return POSITION_KP_NM_PER_RAD, POSITION_KD_NM_S_PER_RAD, 0.0
 
     def _apply_control_gains_locked(self) -> None:
         if self.control_loop is None:
