@@ -66,7 +66,11 @@ MOTOR_STREAM_HZ = 100
 DEFAULT_TARGET_MAX_VELOCITY_RAD_S = _configured_float(
     "TACCAP_TARGET_MAX_VELOCITY_RAD_S", MAX_VELOCITY_RAD_S
 )
-MAX_TARGET_MAX_VELOCITY_RAD_S = 2.0
+# Debugging ceiling for the requested MIT approach speed.  The effective
+# speed is still bounded by the +/-2 Nm feed-forward range and the independent
+# SDK/firmware torque envelope.  With the default kd=1 this starts saturating
+# near 2 rad/s; values up to 4 rad/s are useful when tuning a lower kd.
+MAX_TARGET_MAX_VELOCITY_RAD_S = 4.0
 MAX_DEBUG_KP_NM_PER_RAD = 100.0
 MAX_DEBUG_KD_NM_S_PER_RAD = 50.0
 MAX_DEBUG_FEEDFORWARD_TORQUE_NM = 2.0
@@ -2006,7 +2010,7 @@ function controlCard(side) {
       <label>kd (Nm·s/rad)<input id="kd-${side}" type="number" min="0" max="50" step="0.1"></label>
       <label>前馈力矩 (Nm)<input id="ff-${side}" type="number" min="-2" max="2" step="0.01"></label>
       <label>位置误差力矩上限 (Nm)<input id="limit-${side}" type="number" min="0" max="2" step="0.01"></label>
-      <label>目标速度 (rad/s)<input id="speed-${side}" type="number" min="0" max="2" step="0.01"></label>
+      <label>目标速度 (rad/s)<input id="speed-${side}" type="number" min="0" max="4" step="0.01"></label>
       <label>状态流频率 (Hz)<input value="100" disabled></label>
     </div>
     <div class="row"><button class="tune" onclick="applyTuning('${side}')">应用调参</button><small>速度为主机目标斜坡限制；0=关闭</small></div>

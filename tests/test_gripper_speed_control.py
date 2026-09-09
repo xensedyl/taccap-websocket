@@ -79,6 +79,18 @@ def test_speed_controller_scales_with_requested_speed() -> None:
     assert controller.control_loop.gains[-1] == (8.0, 1.0, 0.1)
 
 
+def test_high_speed_target_is_bounded_by_feedforward_torque() -> None:
+    controller = make_controller(reverse=False)
+    controller.target_max_velocity_rad_s = 4.0
+
+    controller._advance_target_locked(10.01, actual_position=0.5)
+
+    expected_target = 0.5 + 4.0 / server.CONTROL_LOOP_HZ / 1.2
+    assert math.isclose(controller.control_loop.targets[-1], expected_target)
+    assert controller.control_loop.gains[-1] == (8.0, 1.0, 2.0)
+    assert controller.speed_feedforward_torque_nm == 2.0
+
+
 def test_speed_controller_stops_feedforward_at_target() -> None:
     controller = make_controller(reverse=True)
     controller.speed_feedforward_torque_nm = -0.25
