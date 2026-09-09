@@ -64,7 +64,7 @@ MOTOR_STREAM_HZ = 100
 # normalized target, not a velocity argument; the bridge advances that target
 # at the requested raw-radian speed before handing it to ControlLoop.
 DEFAULT_TARGET_MAX_VELOCITY_RAD_S = _configured_float(
-    "TACCAP_TARGET_MAX_VELOCITY_RAD_S", 0.0
+    "TACCAP_TARGET_MAX_VELOCITY_RAD_S", MAX_VELOCITY_RAD_S
 )
 MAX_TARGET_MAX_VELOCITY_RAD_S = 2.0
 MAX_DEBUG_KP_NM_PER_RAD = 100.0
