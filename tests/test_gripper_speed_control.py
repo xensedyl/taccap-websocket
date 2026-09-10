@@ -60,6 +60,15 @@ def make_controller(*, reverse: bool = True):
     return controller
 
 
+def test_default_profile_disables_velocity_assist_and_uses_damped_gains() -> None:
+    assert server.DEFAULT_TARGET_MAX_VELOCITY_RAD_S == 0.0
+    assert (server.MIT_KP_NM_PER_RAD, server.MIT_KD_NM_S_PER_RAD) == (4.0, 2.0)
+    assert (server.POSITION_KP_NM_PER_RAD, server.POSITION_KD_NM_S_PER_RAD) == (
+        4.0,
+        2.0,
+    )
+
+
 def test_speed_controller_uses_feedback_lookahead_and_reverse_direction() -> None:
     controller = make_controller(reverse=True)
 

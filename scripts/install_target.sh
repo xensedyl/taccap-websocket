@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # Internal installer. It is called by ../deploy.sh on the target machine.
-# The target is offline: the bundle contains Python and an installed
-# site-packages snapshot prepared on the connected build host.
+# The default bundle contains public site-packages plus TacCap source and a
+# small offline build-tool wheelhouse.  The native TacCap extension is built
+# here, against this machine's Ubuntu 20.04/glibc/OpenCV installation.
 
 usage() {
     cat <<'USAGE'
@@ -53,6 +54,13 @@ fi
 [[ -f "$offline_dir/manifest.txt" ]] || {
     echo "offline bundle is missing manifest.txt: $offline_dir" >&2; exit 1;
 }
+target_build=0
+if [[ -f "$offline_dir/taccap-source.tar.gz" && -f "$offline_dir/build-wheels.tar.gz" ]]; then
+    target_build=1
+elif [[ -f "$offline_dir/taccap-source.tar.gz" || -f "$offline_dir/build-wheels.tar.gz" ]]; then
+    echo "offline target-build bundle is incomplete: both taccap-source.tar.gz and build-wheels.tar.gz are required" >&2
+    exit 1
+fi
 command -v curl >/dev/null 2>&1 || { echo "curl is required on target" >&2; exit 1; }
 command -v ffmpeg >/dev/null 2>&1 || { echo "ffmpeg is required on target" >&2; exit 1; }
 
@@ -61,14 +69,15 @@ awk 'BEGIN { hashes=0 } /^sha256:/ { hashes=1; next } hashes && NF { print }' \
     "$offline_dir/manifest.txt" | (cd "$offline_dir" && sha256sum -c -)
 
 # Preflight the native modules before stopping a currently working service or
-# replacing its runtime.  This is intentionally performed in a disposable
-# directory because Python extensions are ABI-sensitive: a wheel built on
-# Ubuntu 22.04 can import xensesdk successfully and then fail on
-# xense.taccap with GLIBC_2.32/2.34 errors on Ubuntu 20.04.  A failed
-# preflight leaves the existing installation untouched and never falls back
-# to an interpreter or SDK from another directory.
+# replacing its runtime.  A target build happens in this disposable directory
+# and therefore leaves the existing installation untouched if compilation or
+# import verification fails.
 preflight_dir="$(mktemp -d /tmp/taccap-preflight.XXXXXX)"
-preflight_cleanup() { rm -rf -- "$preflight_dir"; }
+target_build_root=""
+preflight_cleanup() {
+    rm -rf -- "$preflight_dir"
+    [[ -z "$target_build_root" ]] || rm -rf -- "$target_build_root"
+}
 trap preflight_cleanup EXIT
 mkdir -p "$preflight_dir/python" "$preflight_dir/site-packages" "$preflight_dir/lib"
 tar -cf - -C "$offline_dir/python" . | tar -xf - -C "$preflight_dir/python"
@@ -82,6 +91,102 @@ preflight_python="$(find "$preflight_dir/python" \( -type f -o -type l \) \
     echo "offline bundle has no Python 3.12 executable for ABI preflight" >&2
     exit 1
 }
+
+target_wheel=""
+target_build_python=""
+if ((target_build)); then
+    [[ -f "$offline_dir/fmt-headers.tar.gz" ]] || {
+        echo "target-build bundle is missing fmt-headers.tar.gz" >&2
+        exit 1
+    }
+    command -v c++ >/dev/null 2>&1 || {
+        echo "target build requires a C++ compiler (c++)" >&2
+        echo "Install build-essential on this Ubuntu 20.04 target." >&2
+        exit 1
+    }
+    [[ -f /usr/include/opencv4/opencv2/core.hpp ]] || {
+        echo "target build requires Ubuntu OpenCV development headers" >&2
+        echo "Install libopencv-dev on this Ubuntu 20.04 target." >&2
+        exit 1
+    }
+    [[ -f /usr/include/spdlog/spdlog.h ]] || {
+        echo "target build requires spdlog development headers" >&2
+        echo "Install libspdlog-dev on this Ubuntu 20.04 target." >&2
+        exit 1
+    }
+    target_build_root="$(mktemp -d /tmp/taccap-target-build.XXXXXX)"
+    mkdir -p "$target_build_root/source" "$target_build_root/wheel" "$target_build_root/wheels"
+    tar -xzf "$offline_dir/taccap-source.tar.gz" -C "$target_build_root/source"
+    tar -xzf "$offline_dir/build-wheels.tar.gz" -C "$target_build_root/wheels"
+    fmt_prefix=""
+    if [[ -f "$offline_dir/fmt-headers.tar.gz" ]]; then
+        fmt_prefix="$target_build_root/fmt"
+        mkdir -p "$fmt_prefix"
+        tar -xzf "$offline_dir/fmt-headers.tar.gz" -C "$fmt_prefix"
+        mkdir -p "$fmt_prefix/lib/cmake/fmt"
+        cat >"$fmt_prefix/lib/cmake/fmt/fmtConfig.cmake" <<FMT
+set(fmt_FOUND TRUE)
+set(fmt_VERSION 8.1.1)
+if(NOT TARGET fmt::fmt)
+    add_library(fmt::fmt INTERFACE IMPORTED)
+    set_target_properties(fmt::fmt PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "$fmt_prefix/include")
+endif()
+if(NOT TARGET fmt::fmt-header-only)
+    add_library(fmt::fmt-header-only INTERFACE IMPORTED)
+    set_target_properties(fmt::fmt-header-only PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "$fmt_prefix/include")
+endif()
+FMT
+        cp "$fmt_prefix/lib/cmake/fmt/fmtConfig.cmake" \
+            "$fmt_prefix/lib/cmake/fmt/fmt-config.cmake"
+    fi
+    "$preflight_python" - "$target_build_root/source/python/CMakeLists.txt" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+needle = "find_package(spdlog REQUIRED)"
+if "find_package(fmt CONFIG REQUIRED)" not in text:
+    if needle not in text:
+        raise SystemExit(f"cannot patch TacCap CMake file: {path}")
+    text = text.replace(
+        needle,
+        "find_package(fmt CONFIG REQUIRED)\n" + needle,
+        1,
+    )
+    path.write_text(text)
+PY
+    target_build_venv="$target_build_root/venv"
+    "$preflight_python" -m venv --clear "$target_build_venv"
+    target_build_python="$target_build_venv/bin/python"
+    [[ -x "$target_build_python" ]] || {
+        echo "target Python could not create a build venv" >&2
+        exit 1
+    }
+    export PATH="$target_build_venv/bin:$PATH"
+    echo "Building TacCap-Gripper on target Ubuntu 20.04"
+    "$target_build_python" -m pip install --disable-pip-version-check --no-index \
+        --find-links "$target_build_root/wheels" \
+        "setuptools>=68" "scikit-build-core>=0.10" "pybind11>=2.12" cmake ninja
+    (
+        unset CMAKE_PREFIX_PATH PKG_CONFIG_PATH TACCAP_CPP_PREFIX LD_LIBRARY_PATH
+        if [[ -n "$fmt_prefix" ]]; then
+            export CMAKE_PREFIX_PATH="$fmt_prefix"
+        fi
+        export PATH="$target_build_venv/bin:$PATH"
+        "$target_build_python" -m pip wheel --disable-pip-version-check \
+            --no-build-isolation --no-deps \
+            "$target_build_root/source" -w "$target_build_root/wheel"
+    )
+    target_wheel="$(find "$target_build_root/wheel" -maxdepth 1 -type f \
+        -name 'taccap_gripper-*.whl' -print -quit)"
+    [[ -f "$target_wheel" ]] || {
+        echo "TacCap wheel was not produced on target" >&2
+        exit 1
+    }
+    "$target_build_python" -m pip install --disable-pip-version-check \
+        --no-deps --target "$preflight_dir/site-packages" "$target_wheel"
+fi
 # A portable Python archive can be copied from a build host with a different
 # locale.  Verify that its standard-library codecs are present before pip or
 # the SDK import is attempted; this catches incomplete runtimes (for example,
@@ -101,10 +206,9 @@ PY
 fi
 printf '%s\n' "$preflight_codec_output"
 preflight_output=""
-# Do not inherit ROS/conda/old-SDK libraries from the target shell.  A
-# prebuilt wheel must resolve against the target's default system loader
-# paths (Ubuntu 20.04 OpenCV 4.2), plus libraries explicitly shipped in
-# this bundle.
+# Do not inherit ROS/conda/old-SDK libraries from the target shell.  The
+# target-built extension resolves against this machine's default Ubuntu 20.04
+# loader paths, plus libraries explicitly shipped in this bundle.
 if ! preflight_output="$(
     env -u PYTHONPATH -u PYTHONHOME -u PYTHONUSERBASE \
     PYTHONNOUSERSITE=1 \
@@ -129,12 +233,10 @@ PY
     fi
     echo "ERROR: deployment aborted before stopping the existing service." >&2
     echo "ERROR: no /home/guest/py312, system Python, or old SDK fallback is attempted." >&2
-    echo "Build TacCap-Gripper on an Ubuntu 20.04/glibc 2.31 builder (or use a compatible prebuilt artifact), then regenerate the offline bundle." >&2
+    echo "Build TacCap-Gripper on the target Ubuntu 20.04 system, or provide a compatible wheel bundle." >&2
     exit 1
 fi
 printf '%s\n' "$preflight_output"
-preflight_cleanup
-trap - EXIT
 
 # The bundle passed its ABI preflight.  Stop only the existing TacCap service
 # in the requested installation directory before replacing its source/runtime.
@@ -208,6 +310,45 @@ done
 rm -rf -- "$saved_config_dir"
 
 [[ -f "$install_dir/config/taccap.env" ]] || cp "$install_dir/config/taccap.env.example" "$install_dir/config/taccap.env"
+# Migrate the complete legacy tuning profile only when all of its values still
+# match the old template. Older releases defaulted to kp=8/kd=1 plus a 0.60
+# rad/s velocity feed-forward; that combination is under-damped on the TacCap
+# mechanism and is a common reason a jaw keeps ringing after teleoperation.
+# If any one value was deliberately changed, leave the whole custom profile
+# untouched.
+migrate_default_value() {
+    local name="$1" old_value="$2" new_value="$3" tmp
+    tmp="$(mktemp)"
+    awk -v name="$name" -v old_value="$old_value" -v new_value="$new_value" '
+        $0 ~ ("^" name "=") {
+            value = substr($0, length(name) + 2)
+            if (value == old_value) print name "=" new_value
+            else print
+            next
+        }
+        { print }
+    ' "$install_dir/config/taccap.env" >"$tmp"
+    mv -- "$tmp" "$install_dir/config/taccap.env"
+}
+legacy_tuning_profile=1
+for legacy_pair in \
+    'TACCAP_POSITION_KP=8.0' \
+    'TACCAP_POSITION_KD=1.0' \
+    'TACCAP_MIT_KP=8.0' \
+    'TACCAP_MIT_KD=1.0' \
+    'TACCAP_TARGET_MAX_VELOCITY_RAD_S=0.60'; do
+    if ! grep -qxF "$legacy_pair" "$install_dir/config/taccap.env"; then
+        legacy_tuning_profile=0
+        break
+    fi
+done
+if ((legacy_tuning_profile)); then
+    migrate_default_value TACCAP_POSITION_KP 8.0 4.0
+    migrate_default_value TACCAP_POSITION_KD 1.0 2.0
+    migrate_default_value TACCAP_MIT_KP 8.0 4.0
+    migrate_default_value TACCAP_MIT_KD 1.0 2.0
+    migrate_default_value TACCAP_TARGET_MAX_VELOCITY_RAD_S 0.60 0.0
+fi
 # Recreate the managed venv contents on every deployment.  This prevents a
 # removed dependency from surviving an upgrade as a stale package.
 "$base_python" -m venv --clear "$install_dir/.venv"
@@ -215,6 +356,10 @@ python_bin="$install_dir/.venv/bin/python"
 site_packages="$($python_bin -c 'import site; print(site.getsitepackages()[0])')"
 [[ -d "$site_packages" ]] || { echo "target venv site-packages not found: $site_packages" >&2; exit 1; }
 tar -xzf "$offline_dir/site-packages.tar.gz" -C "$site_packages"
+if ((target_build)); then
+    "$target_build_python" -m pip install --disable-pip-version-check \
+        --no-deps --target "$site_packages" "$target_wheel"
+fi
 if [[ -n "$runtime_lib_dir" ]]; then
     export LD_LIBRARY_PATH="$runtime_lib_dir"
 else
@@ -256,6 +401,8 @@ PY
     exit 1
 fi
 printf '%s\n' "$verify_output"
+preflight_cleanup
+trap - EXIT
 
 set_config_value() {
     local name="$1" value="$2" tmp

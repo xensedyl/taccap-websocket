@@ -31,28 +31,20 @@ taccap-websocket/
 
 ## 部署方式
 
-只保留两步。目标机不需要 Python、pip、uv、Git、编译器或网络连接；目标机只需要
-已经具备 Linux USB/UVC 驱动、`ffmpeg`、`curl` 和与 SDK 匹配的系统运行库。
+只保留两步。目标机不需要 Python、pip、uv、Git 或网络连接；目标机需要已经具备
+Linux USB/UVC 驱动、`ffmpeg`、`curl`、C++ 编译器、CMake、OpenCV 4.2 开发包和
+spdlog 开发包。
 
 ### 1. 生成离线 bundle（本机执行）
 
-在可以联网的开发机执行。构建机需要 `uv`、`git`、Python 3.12+、C++ 编译器，
-以及 TacCap-Gripper 所需的 C++ OpenCV 和 spdlog 开发包；脚本会在临时构建环境中
-安装 CMake、Ninja、scikit-build-core 和 pybind11：
+在可以联网的开发机执行。构建机需要 `uv`、`git` 和 Python 3.12+；脚本会下载
+构建工具 wheel，并把它们放入 bundle，供目标 Ubuntu 20.04 机器离线编译：
 （若 `uv` 无法下载 portable Python，可设置 `TACCAP_BUNDLE_RUNTIME` 指向一个
 已准备好的 Python 3.12 runtime 目录。）
 
-如果 C++ 依赖安装在 conda/mamba 环境而不是系统路径，脚本会自动使用当前已激活
-环境的 `CONDA_PREFIX`/`MAMBA_PREFIX`。也可以显式指定该环境的前缀：
-
-```bash
-export TACCAP_CPP_PREFIX=/path/to/cpp-deps-env
-```
-
-这个前缀只用于构建机编译。`xense.taccap` 含有 C++ 原生扩展，必须在不高于目标
-系统 ABI 的环境中构建：例如要部署到 Ubuntu 20.04，就应在 Ubuntu 20.04/glibc
-2.31 的构建机（或兼容构建机）生成 bundle。Ubuntu 22.04 上生成的扩展可能要求
-`GLIBC_2.32` 或更高版本，不能部署到 Ubuntu 20.04。
+`xense.taccap` 含有 C++ 原生扩展。默认流程把 TacCap 源码和构建工具一起放进
+bundle，部署时在目标 Ubuntu 20.04 机器上直接编译，因此自动使用目标机的 glibc、
+OpenCV 4.2 和 spdlog。
 
 ```bash
 cd /home/xense/tron2/taccap-websocket
@@ -64,7 +56,11 @@ cd /home/xense/tron2/taccap-websocket
 脚本会生成 `offline/`，其中包含：
 
 - 可复制的 Python 3.12 运行时；
-- 已安装的 `site-packages.tar.gz`（包括 `xensesdk`、`taccap-gripper` 和传递依赖）；
+- 已安装的 `site-packages.tar.gz`（包括 `xensesdk` 和传递依赖）；
+- `taccap-source.tar.gz`（从 Git 获取的 TacCap-Gripper 源码）；
+- `build-wheels.tar.gz`（离线编译所需的 setuptools、scikit-build-core、pybind11、
+  CMake 和 Ninja wheel）；
+- `fmt-headers.tar.gz`（目标机 spdlog CMake 配置需要的 fmt 头文件）；
 - `manifest.txt` 及归档 SHA256。
 
 `xensesdk` 使用 pip 的包名安装，因此可通过 pip 默认索引、公司内部索引或本机
@@ -75,33 +71,10 @@ bundle 则允许用 `--taccap-source` 指向本机 checkout，避免重复 clone
 ./bundle.sh --taccap-source /home/xense/tron2/TacCap-Gripper
 ```
 
-如果本机不是 Ubuntu 20.04，不要在本机编译 TacCap 原生扩展。先在 Ubuntu 20.04
-构建机上生成 wheel，再复制回本机组装 bundle。当前 `.4` 使用系统 OpenCV 4.2，
-因此不能使用在 Ubuntu 22.04 上编译、依赖 `libopencv_*.so.4.5d` 的 wheel：
-
-```bash
-./bundle.sh \
-  --taccap-wheel /path/to/taccap_gripper-*.whl \
-  --xensesdk 'xensesdk==2.1.3'
-```
-
-`--taccap-wheel` 只替换 TacCap 原生扩展来源；Python runtime、xensesdk 和离线
-归档仍由本机生成。wheel 必须来自不高于目标系统 ABI 的构建机。脚本不会在构建
-机上强行加载目标机没有的 OpenCV SONAME，而是把最终导入检查留给目标机；这样
-Ubuntu 20.04 的系统 `libopencv_*.so.4.2` 可以正常解析。
-
-本项目开发机已经保存了一份可供 `.4` 使用的 wheel，可直接执行：
-
-```bash
-cd /home/xense/tron2/taccap-websocket
-./bundle.sh \
-  --taccap-wheel /home/xense/taccap-sdk-wheels/taccap_gripper-0.1.9-cp312-cp312-linux_x86_64.whl \
-  --xensesdk 'xensesdk==2.1.3'
-```
-
-不要把之前用普通 `--taccap-source` 在 Ubuntu 22.04 上生成的 `offline/` 继续部署
-到 `.4`；其中的原生模块会绑定 `libopencv_core.so.4.5d`，并可能要求高于
-Ubuntu 20.04 的 glibc。重新生成 bundle 后再执行 `./deploy.sh guest@10.192.1.4`。
+本机不会编译 TacCap 原生扩展，也不需要保存私有 wheel 路径。`bundle.sh` 只在本机
+下载源码和 Python 构建工具；`deploy.sh` 把它们传到目标后，由目标机完成 CMake
+构建和安装。目标机需要已有 Ubuntu 20.04 的编译器、CMake、OpenCV 开发包和 spdlog
+开发包；目标机完全不需要联网。
 
 若 `xensesdk` 不是默认版本，可传入 requirement：
 
@@ -109,14 +82,13 @@ Ubuntu 20.04 的 glibc。重新生成 bundle 后再执行 `./deploy.sh guest@10.
 ./bundle.sh --xensesdk 'xensesdk==2.1.3'
 ```
 
-下载、编译和安装只发生在联网构建机；目标机只解包已安装的 Python 文件，完全不会
-访问 Python 包索引，也不需要 pip、uv、Git 或编译器。发布包不包含任何 `.whl`；
-构建过程中 pip 产生的临时构建产物会在脚本退出时删除。
+本机联网只用于下载公开依赖和构建工具 wheel。目标机通过 `--no-index` 使用 bundle
+中的 wheelhouse 编译 TacCap，不访问 Python 包索引，也不需要 Git、uv 或外部 wheel。
+构建生成的 TacCap wheel 只保存在目标机临时目录，安装后自动清理。
 
-安装器会在停止现有服务前，在临时目录中导入 `xensesdk` 和 `xense.taccap` 做 ABI
-预检。预检失败会直接报错并退出，不会使用目标机遗留的 `/home/guest/py312`、
-系统 Python 或旧 TacCap SDK 作为替代。此时必须在兼容的 Ubuntu 20.04 构建机重新
-生成 bundle。
+安装器会在停止现有服务前，先在目标机临时目录编译并导入 `xensesdk` 和
+`xense.taccap` 做 ABI 预检。预检失败会直接报错并退出，不会使用目标机遗留的
+`/home/guest/py312`、系统 Python 或旧 TacCap SDK 作为替代。
 
 ### 2. SSH 一键部署到新设备
 
@@ -220,7 +192,7 @@ TACCAP_LEFT_GRIPPER_CONTROL_MODE=mit
 TACCAP_RIGHT_GRIPPER_CONTROL_MODE=position
 ```
 
-位置模式参数默认是 `kp=8.0`、`kd=1.0`；MIT 参数默认是 `kp=8.0`、`kd=1.0`、
+位置模式参数默认是 `kp=4.0`、`kd=2.0`；MIT 参数默认是 `kp=4.0`、`kd=2.0`、
 前馈力矩 `0.0 Nm`，可以通过
 `TACCAP_POSITION_KP`、`TACCAP_POSITION_KD`、
 `TACCAP_MIT_KP`、`TACCAP_MIT_KD` 和 `TACCAP_MIT_FEEDFORWARD_TORQUE` 调整。
@@ -229,6 +201,13 @@ TACCAP_RIGHT_GRIPPER_CONTROL_MODE=position
 
 调试时可以通过 Web 页面每个夹爪卡片中的“应用调参”修改当前或指定模式的
 `kp`、`kd`、有符号的基础前馈力矩、速度前馈上限、位置误差力矩上限和目标速度。
+服务默认使用较保守、阻尼更高的 `kp=4.0`、`kd=2.0`，并将主机侧目标速度设为
+`0`（关闭额外速度前馈），以避免夹爪到位后因欠阻尼或速度前馈而来回振荡。
+如需调试速度环，再在网页中显式设置目标速度；建议从较小值逐步增加。
+每次 LeRobot 遥操作连接时也会重新下发这组阻尼参数并清零目标速度，避免沿用上一次
+网页调参残留在 `.4` 进程中的速度前馈。
+升级已有设备时，部署脚本只会把仍完整保持旧默认值（8/1、0.60）的配置自动迁移到
+该保守配置；如果你改过其中任意一项，则视为有意调参并原样保留。
 也可以直接调用 REST API：
 
 ```bash
@@ -241,7 +220,7 @@ curl -X POST http://10.192.1.4:8765/api/grippers/left/control_parameters \
   -d '{"mode":"mit","kp_nm_per_rad":12,"kd_nm_s_per_rad":1.5,
        "feedforward_torque_nm":0,"speed_feedforward_limit_nm":1.0,
        "max_position_torque_nm":0.25,
-       "target_max_velocity_rad_s":0.6}'
+       "target_max_velocity_rad_s":0.0}'
 ```
 
 参数有服务端安全上限，当前分别是 `kp≤100`、`kd≤50`、前馈力矩绝对值
@@ -259,7 +238,7 @@ curl -X POST http://10.192.1.4:8765/api/grippers/left/control_parameters \
 每个新位置目标只启动一次速度辅助接近；进入容差或越过目标后会锁存为 `holding`，
 速度前馈清零并固定下发最终目标，之后的回弹或反馈噪声不会重新启动或反转速度前馈。
 目标速度是受安全约束的运动目标，不保证任何负载下都能达到该数值；当速度目标较高
-而 `kd × 目标速度` 超过前馈上限时，速度会因饱和而低于设定值。因此默认
+而 `kd × 目标速度` 超过前馈上限时，速度会因饱和而低于设定值。因此在
 `kd=1.0` 时约从 `2 rad/s` 起不再增加速度前馈；调试 `3–4 rad/s` 时需要逐步将
 `kd` 降至约 `0.7–0.5`，并同时观察实际速度、力矩和温度。新版 SDK 的
 `STREAM_LOCKED` 模式下，控制循环频率和电机状态流固定为 100 Hz，不能通过旧的

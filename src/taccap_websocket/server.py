@@ -53,23 +53,28 @@ def _configured_float(name: str, default: float) -> float:
     return result
 
 
-MIT_KP_NM_PER_RAD = _configured_float("TACCAP_MIT_KP", 8.0)
-MIT_KD_NM_S_PER_RAD = _configured_float("TACCAP_MIT_KD", 1.0)
+MIT_KP_NM_PER_RAD = _configured_float("TACCAP_MIT_KP", 4.0)
+MIT_KD_NM_S_PER_RAD = _configured_float("TACCAP_MIT_KD", 2.0)
 MIT_FEEDFORWARD_TORQUE_NM = _configured_float("TACCAP_MIT_FEEDFORWARD_TORQUE", 0.0)
-POSITION_KP_NM_PER_RAD = _configured_float("TACCAP_POSITION_KP", 8.0)
-POSITION_KD_NM_S_PER_RAD = _configured_float("TACCAP_POSITION_KD", 1.0)
+POSITION_KP_NM_PER_RAD = _configured_float("TACCAP_POSITION_KP", 4.0)
+POSITION_KD_NM_S_PER_RAD = _configured_float("TACCAP_POSITION_KD", 2.0)
 CONTROL_LOOP_HZ = 100
 MOTOR_STREAM_HZ = 100
 # Optional host-side target slew limit.  The SDK ControlLoop accepts a
 # normalized target, not a velocity argument; the bridge advances that target
 # at the requested raw-radian speed before handing it to ControlLoop.
 DEFAULT_TARGET_MAX_VELOCITY_RAD_S = _configured_float(
-    "TACCAP_TARGET_MAX_VELOCITY_RAD_S", MAX_VELOCITY_RAD_S
+    # A non-zero speed feed-forward is an optional tuning aid.  It is off by
+    # default because a position/impedance step already has its own damping;
+    # adding a signed torque bias is exactly what can make a jaw overshoot and
+    # ring when the operator releases the trigger.  It remains available from
+    # the web API (or TACCAP_TARGET_MAX_VELOCITY_RAD_S) for deliberate tuning.
+    "TACCAP_TARGET_MAX_VELOCITY_RAD_S", 0.0
 )
 # Debugging ceiling for the requested MIT approach speed.  The effective
 # speed is still bounded by the +/-2 Nm feed-forward range and the independent
-# SDK/firmware torque envelope.  With the default kd=1 this starts saturating
-# near 2 rad/s; values up to 4 rad/s are useful when tuning a lower kd.
+# SDK/firmware torque envelope.  With kd=1 this starts saturating near 2 rad/s;
+# values up to 4 rad/s are useful only when deliberately tuning a lower kd.
 MAX_TARGET_MAX_VELOCITY_RAD_S = 4.0
 MAX_DEBUG_KP_NM_PER_RAD = 100.0
 MAX_DEBUG_KD_NM_S_PER_RAD = 50.0
@@ -83,7 +88,14 @@ if not 0.0 <= DEFAULT_SPEED_FEEDFORWARD_LIMIT_NM <= MAX_DEBUG_FEEDFORWARD_TORQUE
         "TACCAP_SPEED_FEEDFORWARD_LIMIT_NM must be between 0 and "
         f"{MAX_DEBUG_FEEDFORWARD_TORQUE_NM} Nm"
     )
-SPEED_CONTROL_POSITION_TOLERANCE = 0.002
+# A trigger/encoder sample can easily move by a few thousandths of the
+# normalized travel while the operator is holding still. Treat a target inside
+# this window as arrived so the velocity-assist phase is latched off instead of
+# repeatedly hunting around the requested position.
+SPEED_CONTROL_POSITION_TOLERANCE = 0.01
+# Ignore smaller command changes at the HTTP boundary as well. This is a
+# second line of defence for clients that do not smooth their trigger input.
+POSITION_COMMAND_DEADBAND = 0.005
 
 MOTOR_MODE_NAMES = {
     0: "idle",
@@ -689,6 +701,13 @@ class GripperController:
             raise ApiError(HTTPStatus.BAD_REQUEST, "speed_feedforward_limit_nm is outside the safety range")
 
         with self.lock:
+            # A speed target is an optional approach aid, not a persistent
+            # motor command.  Changing gains/ff from the web UI must not leave
+            # a previous approach phase active with a new torque law.
+            if target_velocity is not None or any(value is not None for value in updates.values()):
+                self._target_motion_active = False
+                self._target_motion_direction = 0.0
+                self.speed_feedforward_torque_nm = 0.0
             previous_mode = self.control_mode
             self.control_mode = mode
             for name, value in updates.items():
@@ -859,7 +878,10 @@ class GripperController:
                 )
                 if reached:
                     # Arrival (or a one-tick overshoot) permanently ends this
-                    # approach. Position impedance now owns the final target;
+                    # approach. Keep the requested position as the final
+                    # impedance target; only the velocity-assist term is
+                    # removed. The conservative default gains (kp=4, kd=2)
+                    # then provide a damped position hold, while feedback
                     # noise cannot restart speed control. Only a different
                     # position request may start another approach.
                     self._target_motion_active = False
@@ -1276,8 +1298,15 @@ class GripperController:
                 )
                 target_changed = (
                     self.target_position is None
-                    or abs(position - self.target_position) > 1e-7
+                    or abs(position - self.target_position) > POSITION_COMMAND_DEADBAND
                 )
+                if not target_changed:
+                    # Keep the service lease alive, but do not restart the
+                    # approach phase or rewrite the ControlLoop target for a
+                    # sub-deadband trigger fluctuation.
+                    self.last_lease = time.monotonic()
+                    self.last_error = None
+                    return self.status()
                 self.target_position = position
                 if target_changed:
                     delta = (

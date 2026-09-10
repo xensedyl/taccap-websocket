@@ -5,8 +5,9 @@ usage() {
     cat <<'USAGE'
 Usage: ./deploy.sh USER@HOST [options]
 
-Deploy the complete offline release to a new target over SSH.
-The target does not need Python, pip, uv, Git or network access.
+Deploy the complete offline release to a new target over SSH. The target does
+not need Python, pip, uv, Git or network access; it builds TacCap from the
+bundled source using its local Ubuntu 20.04 C++/OpenCV toolchain.
 
 Options:
   --bundle DIR       Offline bundle from ./bundle.sh (default: ./offline)
@@ -88,6 +89,9 @@ tar \
 
 offline_files=(python site-packages.tar.gz manifest.txt)
 [[ -f "$bundle_dir/runtime-libs.tar.gz" ]] && offline_files+=(runtime-libs.tar.gz)
+[[ -f "$bundle_dir/taccap-source.tar.gz" ]] && offline_files+=(taccap-source.tar.gz)
+[[ -f "$bundle_dir/build-wheels.tar.gz" ]] && offline_files+=(build-wheels.tar.gz)
+[[ -f "$bundle_dir/fmt-headers.tar.gz" ]] && offline_files+=(fmt-headers.tar.gz)
 tar -czf - -C "$bundle_dir" "${offline_files[@]}" |
     remote_ssh "tar -xzf - -C $remote_tmp_q/offline"
 remote_ssh "printf '%s\n' $(shell_quote "$commit") > $remote_tmp_q/source/.release"
