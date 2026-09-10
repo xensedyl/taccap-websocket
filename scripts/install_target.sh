@@ -310,11 +310,9 @@ done
 rm -rf -- "$saved_config_dir"
 
 [[ -f "$install_dir/config/taccap.env" ]] || cp "$install_dir/config/taccap.env.example" "$install_dir/config/taccap.env"
-# Migrate the complete legacy tuning profile only when all of its values still
-# match the old template. Older releases defaulted to kp=8/kd=1 plus a 0.60
-# rad/s velocity feed-forward; that combination is under-damped on the TacCap
-# mechanism and is a common reason a jaw keeps ringing after teleoperation.
-# If any one value was deliberately changed, leave the whole custom profile
+# Migrate only complete, known default profiles. The previous release shipped
+# 4/2 gains with target speed 0; older releases shipped 8/1 with target speed
+# 0.60. A partially edited file is treated as intentional tuning and is left
 # untouched.
 migrate_default_value() {
     local name="$1" old_value="$2" new_value="$3" tmp
@@ -330,24 +328,48 @@ migrate_default_value() {
     ' "$install_dir/config/taccap.env" >"$tmp"
     mv -- "$tmp" "$install_dir/config/taccap.env"
 }
-legacy_tuning_profile=1
+legacy_tuning_profile=""
+legacy_profile_42=1
 for legacy_pair in \
-    'TACCAP_POSITION_KP=8.0' \
-    'TACCAP_POSITION_KD=1.0' \
-    'TACCAP_MIT_KP=8.0' \
-    'TACCAP_MIT_KD=1.0' \
-    'TACCAP_TARGET_MAX_VELOCITY_RAD_S=0.60'; do
+    'TACCAP_POSITION_KP=4.0' \
+    'TACCAP_POSITION_KD=2.0' \
+    'TACCAP_MIT_KP=4.0' \
+    'TACCAP_MIT_KD=2.0' \
+    'TACCAP_TARGET_MAX_VELOCITY_RAD_S=0.0'; do
     if ! grep -qxF "$legacy_pair" "$install_dir/config/taccap.env"; then
-        legacy_tuning_profile=0
+        legacy_profile_42=0
         break
     fi
 done
-if ((legacy_tuning_profile)); then
-    migrate_default_value TACCAP_POSITION_KP 8.0 4.0
-    migrate_default_value TACCAP_POSITION_KD 1.0 2.0
-    migrate_default_value TACCAP_MIT_KP 8.0 4.0
-    migrate_default_value TACCAP_MIT_KD 1.0 2.0
-    migrate_default_value TACCAP_TARGET_MAX_VELOCITY_RAD_S 0.60 0.0
+if ((legacy_profile_42)); then
+    legacy_tuning_profile=profile_42
+else
+    legacy_profile_81=1
+    for legacy_pair in \
+        'TACCAP_POSITION_KP=8.0' \
+        'TACCAP_POSITION_KD=1.0' \
+        'TACCAP_MIT_KP=8.0' \
+        'TACCAP_MIT_KD=1.0' \
+        'TACCAP_TARGET_MAX_VELOCITY_RAD_S=0.60'; do
+        if ! grep -qxF "$legacy_pair" "$install_dir/config/taccap.env"; then
+            legacy_profile_81=0
+            break
+        fi
+    done
+    ((legacy_profile_81)) && legacy_tuning_profile=profile_81
+fi
+if [[ "$legacy_tuning_profile" == profile_42 ]]; then
+    migrate_default_value TACCAP_POSITION_KP 4.0 8.0
+    migrate_default_value TACCAP_POSITION_KD 2.0 1.0
+    migrate_default_value TACCAP_MIT_KP 4.0 8.0
+    migrate_default_value TACCAP_MIT_KD 2.0 1.0
+    migrate_default_value TACCAP_TARGET_MAX_VELOCITY_RAD_S 0.0 2.0
+elif [[ "$legacy_tuning_profile" == profile_81 ]]; then
+    migrate_default_value TACCAP_TARGET_MAX_VELOCITY_RAD_S 0.60 2.0
+fi
+if [[ -n "$legacy_tuning_profile" ]] &&
+   ! grep -q '^TACCAP_POSITION_TORQUE_NM=' "$install_dir/config/taccap.env"; then
+    printf '\nTACCAP_POSITION_TORQUE_NM=1.8\n' >>"$install_dir/config/taccap.env"
 fi
 # Recreate the managed venv contents on every deployment.  This prevents a
 # removed dependency from surviving an upgrade as a stale package.

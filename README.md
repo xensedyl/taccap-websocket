@@ -170,7 +170,7 @@ curl -X POST http://10.192.1.4:8765/api/grippers/left/control_mode \
 
 服务支持两种夹爪命令模式，默认是 `position`，以保持旧客户端兼容：
 
-- `position`：使用 SDK `ControlLoop` 的保守阻抗增益；
+- `position`：使用 SDK `ControlLoop` 的位置阻抗增益；
 - `mit`：使用 SDK `ControlLoop` 的 MIT 阻抗增益和前馈力矩。当前 SDK 已经从
   Python 中移除裸 `Motor.submit_impedance()` / `Motor.set_position()`，因此两种
   模式都通过 `ControlLoop` 的安全、锁相实时路径发送。
@@ -192,22 +192,22 @@ TACCAP_LEFT_GRIPPER_CONTROL_MODE=mit
 TACCAP_RIGHT_GRIPPER_CONTROL_MODE=position
 ```
 
-位置模式参数默认是 `kp=4.0`、`kd=2.0`；MIT 参数默认是 `kp=4.0`、`kd=2.0`、
-前馈力矩 `0.0 Nm`，可以通过
+位置模式和 MIT 模式参数默认都是 `kp=8.0`、`kd=1.0`；基础前馈力矩默认是
+`0.0 Nm`，速度前馈上限默认是 `2.0 Nm`，位置误差力矩的启动值默认是
+`1.8 Nm`，目标速度默认是 `2.0 rad/s`。这些值可以通过
 `TACCAP_POSITION_KP`、`TACCAP_POSITION_KD`、
-`TACCAP_MIT_KP`、`TACCAP_MIT_KD` 和 `TACCAP_MIT_FEEDFORWARD_TORQUE` 调整。
+`TACCAP_MIT_KP`、`TACCAP_MIT_KD`、`TACCAP_MIT_FEEDFORWARD_TORQUE`、
+`TACCAP_POSITION_TORQUE_NM`、`TACCAP_TARGET_MAX_VELOCITY_RAD_S` 和
+`TACCAP_SPEED_FEEDFORWARD_LIMIT_NM` 调整。
 服务状态中的 `command_mode` 表示当前选中的增益组；当前 SDK 的安全控制器实际
 发送的是 MIT impedance 帧，`control_mode_name` 会显示 `impedance (MIT)`。
 
 调试时可以通过 Web 页面每个夹爪卡片中的“应用调参”修改当前或指定模式的
 `kp`、`kd`、有符号的基础前馈力矩、速度前馈上限、位置误差力矩上限和目标速度。
-服务默认使用较保守、阻尼更高的 `kp=4.0`、`kd=2.0`，并将主机侧目标速度设为
-`0`（关闭额外速度前馈），以避免夹爪到位后因欠阻尼或速度前馈而来回振荡。
-如需调试速度环，再在网页中显式设置目标速度；建议从较小值逐步增加。
-每次 LeRobot 遥操作连接时也会重新下发这组阻尼参数并清零目标速度，避免沿用上一次
-网页调参残留在 `.4` 进程中的速度前馈。
-升级已有设备时，部署脚本只会把仍完整保持旧默认值（8/1、0.60）的配置自动迁移到
-该保守配置；如果你改过其中任意一项，则视为有意调参并原样保留。
+启动时使用上述默认调参；网页保存的运行时参数仍只作用于当前服务进程。
+位置误差力矩的 `1.8 Nm` 是初始值，网页/API 的可调安全上限仍为 `2.0 Nm`，
+并没有把安全上限缩小为 `1.8 Nm`。升级已有设备时，部署脚本只会把仍完整保持
+旧默认值的配置迁移到当前默认值；如果你改过其中任意一项，则视为有意调参并原样保留。
 也可以直接调用 REST API：
 
 ```bash
@@ -219,8 +219,8 @@ curl -X POST http://10.192.1.4:8765/api/grippers/left/control_parameters \
   -H 'Content-Type: application/json' \
   -d '{"mode":"mit","kp_nm_per_rad":12,"kd_nm_s_per_rad":1.5,
        "feedforward_torque_nm":0,"speed_feedforward_limit_nm":1.0,
-       "max_position_torque_nm":0.25,
-       "target_max_velocity_rad_s":0.0}'
+       "max_position_torque_nm":1.8,
+       "target_max_velocity_rad_s":2.0}'
 ```
 
 参数有服务端安全上限，当前分别是 `kp≤100`、`kd≤50`、前馈力矩绝对值

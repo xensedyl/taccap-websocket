@@ -60,13 +60,18 @@ def make_controller(*, reverse: bool = True):
     return controller
 
 
-def test_default_profile_disables_velocity_assist_and_uses_damped_gains() -> None:
-    assert server.DEFAULT_TARGET_MAX_VELOCITY_RAD_S == 0.0
-    assert (server.MIT_KP_NM_PER_RAD, server.MIT_KD_NM_S_PER_RAD) == (4.0, 2.0)
+def test_default_profile_uses_requested_gains_and_motion_limits() -> None:
+    assert server.DEFAULT_TARGET_MAX_VELOCITY_RAD_S == 2.0
+    assert (server.MIT_KP_NM_PER_RAD, server.MIT_KD_NM_S_PER_RAD) == (8.0, 1.0)
     assert (server.POSITION_KP_NM_PER_RAD, server.POSITION_KD_NM_S_PER_RAD) == (
-        4.0,
-        2.0,
+        8.0,
+        1.0,
     )
+    assert server.MIT_FEEDFORWARD_TORQUE_NM == 0.0
+    assert server.DEFAULT_SPEED_FEEDFORWARD_LIMIT_NM == 2.0
+    assert server.DEFAULT_POSITION_TORQUE_NM == 1.8
+    # 1.8 Nm is the startup value, not a reduction of the API safety ceiling.
+    assert server.MAX_DEBUG_POSITION_TORQUE_NM == 2.0
 
 
 def test_speed_controller_uses_feedback_lookahead_and_reverse_direction() -> None:

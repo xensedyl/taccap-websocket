@@ -53,23 +53,18 @@ def _configured_float(name: str, default: float) -> float:
     return result
 
 
-MIT_KP_NM_PER_RAD = _configured_float("TACCAP_MIT_KP", 4.0)
-MIT_KD_NM_S_PER_RAD = _configured_float("TACCAP_MIT_KD", 2.0)
+MIT_KP_NM_PER_RAD = _configured_float("TACCAP_MIT_KP", 8.0)
+MIT_KD_NM_S_PER_RAD = _configured_float("TACCAP_MIT_KD", 1.0)
 MIT_FEEDFORWARD_TORQUE_NM = _configured_float("TACCAP_MIT_FEEDFORWARD_TORQUE", 0.0)
-POSITION_KP_NM_PER_RAD = _configured_float("TACCAP_POSITION_KP", 4.0)
-POSITION_KD_NM_S_PER_RAD = _configured_float("TACCAP_POSITION_KD", 2.0)
+POSITION_KP_NM_PER_RAD = _configured_float("TACCAP_POSITION_KP", 8.0)
+POSITION_KD_NM_S_PER_RAD = _configured_float("TACCAP_POSITION_KD", 1.0)
 CONTROL_LOOP_HZ = 100
 MOTOR_STREAM_HZ = 100
 # Optional host-side target slew limit.  The SDK ControlLoop accepts a
 # normalized target, not a velocity argument; the bridge advances that target
 # at the requested raw-radian speed before handing it to ControlLoop.
 DEFAULT_TARGET_MAX_VELOCITY_RAD_S = _configured_float(
-    # A non-zero speed feed-forward is an optional tuning aid.  It is off by
-    # default because a position/impedance step already has its own damping;
-    # adding a signed torque bias is exactly what can make a jaw overshoot and
-    # ring when the operator releases the trigger.  It remains available from
-    # the web API (or TACCAP_TARGET_MAX_VELOCITY_RAD_S) for deliberate tuning.
-    "TACCAP_TARGET_MAX_VELOCITY_RAD_S", 0.0
+    "TACCAP_TARGET_MAX_VELOCITY_RAD_S", 2.0
 )
 # Debugging ceiling for the requested MIT approach speed.  The effective
 # speed is still bounded by the +/-2 Nm feed-forward range and the independent
@@ -80,6 +75,14 @@ MAX_DEBUG_KP_NM_PER_RAD = 100.0
 MAX_DEBUG_KD_NM_S_PER_RAD = 50.0
 MAX_DEBUG_FEEDFORWARD_TORQUE_NM = 2.0
 MAX_DEBUG_POSITION_TORQUE_NM = 2.0
+DEFAULT_POSITION_TORQUE_NM = _configured_float(
+    "TACCAP_POSITION_TORQUE_NM", 1.8
+)
+if not 0.0 <= DEFAULT_POSITION_TORQUE_NM <= MAX_DEBUG_POSITION_TORQUE_NM:
+    raise ValueError(
+        "TACCAP_POSITION_TORQUE_NM must be between 0 and "
+        f"{MAX_DEBUG_POSITION_TORQUE_NM} Nm"
+    )
 DEFAULT_SPEED_FEEDFORWARD_LIMIT_NM = _configured_float(
     "TACCAP_SPEED_FEEDFORWARD_LIMIT_NM", MAX_DEBUG_FEEDFORWARD_TORQUE_NM
 )
@@ -515,7 +518,7 @@ class GripperController:
                 "feedforward_torque_nm": MIT_FEEDFORWARD_TORQUE_NM,
             },
         }
-        self.max_position_torque_nm = MAX_TORQUE_NM
+        self.max_position_torque_nm = DEFAULT_POSITION_TORQUE_NM
         self.target_max_velocity_rad_s = DEFAULT_TARGET_MAX_VELOCITY_RAD_S
         self.speed_feedforward_limit_nm = DEFAULT_SPEED_FEEDFORWARD_LIMIT_NM
         # Default SDK limits are intentionally kept separate from the old
@@ -558,9 +561,9 @@ class GripperController:
         """Select the command primitive used by subsequent position requests.
 
         Current TacCap SDKs intentionally remove raw motor ``submit_*`` and
-        ``set_position`` methods from Python.  Both web modes therefore use
-        the SDK ``ControlLoop``; ``position`` selects conservative gains and
-        ``mit`` selects the configured impedance gains.
+        ``set_position`` methods from Python. Both web modes therefore use
+        the SDK ``ControlLoop``; each mode selects its configured impedance
+        gain group.
         """
 
         mode = self._validate_control_mode(mode)
@@ -880,10 +883,10 @@ class GripperController:
                     # Arrival (or a one-tick overshoot) permanently ends this
                     # approach. Keep the requested position as the final
                     # impedance target; only the velocity-assist term is
-                    # removed. The conservative default gains (kp=4, kd=2)
-                    # then provide a damped position hold, while feedback
-                    # noise cannot restart speed control. Only a different
-                    # position request may start another approach.
+                    # removed. The configured gains then provide the final
+                    # position hold, while feedback noise cannot restart
+                    # speed control. Only a different position request may
+                    # start another approach.
                     self._target_motion_active = False
                     self._target_motion_direction = 0.0
                     applied = requested
