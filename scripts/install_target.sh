@@ -486,6 +486,27 @@ if command -v systemctl >/dev/null 2>&1 &&
 else
     echo "warning: user systemd unavailable; using scripts/taccap.sh" >&2
 fi
+
+# A user unit is tied to the user's systemd manager.  On Ubuntu, that manager
+# is normally stopped when the last SSH session closes unless lingering is
+# enabled; the service then receives SIGTERM and the web page appears to go
+# offline even though the process itself did not crash.  Enabling linger is a
+# privileged operation, so try only a non-interactive sudo invocation and give
+# an actionable warning when the target policy requires an administrator.
+if ((start_directly == 0)) && command -v loginctl >/dev/null 2>&1; then
+    linger_state="$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)"
+    if [[ "$linger_state" != "yes" ]] && command -v sudo >/dev/null 2>&1; then
+        if sudo -n loginctl enable-linger "$USER" >/dev/null 2>&1; then
+            linger_state="yes"
+            echo "Enabled systemd user lingering for $USER."
+        fi
+    fi
+    if [[ "$linger_state" != "yes" ]]; then
+        echo "warning: systemd user lingering is disabled for $USER." >&2
+        echo "warning: the service may stop when the SSH session closes." >&2
+        echo "warning: run once as an administrator: sudo loginctl enable-linger $USER" >&2
+    fi
+fi
 if ((no_start == 0 && start_directly == 1)); then
     "$install_dir/scripts/taccap.sh" start
 elif ((no_start == 1)); then

@@ -107,6 +107,11 @@ bundle 则允许用 `--taccap-source` 指向本机 checkout，避免重复 clone
 5. 写入用户级 systemd 服务并启动；
 6. 使用目标机的 `ffmpeg` 启动六路视频和夹爪接口。
 
+安装器还会检查用户级 systemd 的 lingering 状态。若目标机允许当前用户免密码
+执行 `sudo loginctl enable-linger`，会自动开启；否则安装完成时会打印一次命令提示。
+必须开启 lingering，否则 SSH 会话退出后用户级 systemd 可能停止服务，网页会表现为
+“掉线”。
+
 指定安装目录：
 
 ```bash
